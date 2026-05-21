@@ -479,17 +479,30 @@ def extract_problem_image_rows(document: Document, detail_start: int, detail_end
     if current_heading or current_rows:
         sections.append((current_heading, current_rows))
 
-    matched_rows = [
-        row
-        for heading, rows in sections
-        if detail_heading_matches_issue(heading, issue_text)
-        for row in rows
-    ]
-    if matched_rows:
-        return tuple(matched_rows)
-
     all_rows = [row for _, rows in sections for row in rows]
-    return tuple(all_rows)
+    issue_items = split_issue_items(issue_text)
+    if not issue_items:
+        return tuple(all_rows)
+
+    matched_rows: list[ImageRow] = []
+    seen_signatures: set[tuple[tuple[int, bytes], ...]] = set()
+    for item in issue_items:
+        item_rows = [
+            row
+            for heading, rows in sections
+            if detail_heading_matches_issue(heading, item)
+            for row in rows
+        ]
+        if not item_rows:
+            return tuple(all_rows)
+        for row in item_rows:
+            signature = image_row_signature(row)
+            if signature in seen_signatures:
+                continue
+            matched_rows.append(row)
+            seen_signatures.add(signature)
+
+    return tuple(matched_rows)
 
 
 def parse_daily_report(path: Path, categories: list[tuple[str, tuple[str, ...]]]) -> list[DailyRecord]:
@@ -573,6 +586,21 @@ def set_cell_text(cell, text: str, bold: bool = False) -> None:
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
 
+def remove_empty_paragraph(paragraph) -> None:
+    paragraph._element.getparent().remove(paragraph._element)
+    paragraph._p = paragraph._element = None
+
+
+def cleanup_empty_paragraphs(document: Document) -> None:
+    for paragraph in list(document.paragraphs):
+        xml = paragraph._p.xml
+        if paragraph.text.strip():
+            continue
+        if "a:blip" in xml or "v:imagedata" in xml or "w:sectPr" in xml:
+            continue
+        remove_empty_paragraph(paragraph)
+
+
 def configure_styles(document: Document) -> None:
     normal = document.styles["Normal"]
     normal.font.name = "仿宋"
@@ -615,13 +643,15 @@ def add_paragraph(document: Document, text: str, *, bold: bool = False, align=No
 
 
 def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None:
-    for image_row in image_rows:
+    images = [image for image_row in image_rows for image in image_row.images]
+    for index in range(0, len(images), 2):
+        row_images = images[index : index + 2]
         paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if image_row.centered else WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.line_spacing = 1.0
         paragraph.paragraph_format.space_before = Pt(0)
         paragraph.paragraph_format.space_after = Pt(0)
-        for image in image_row.images:
+        for image in row_images:
             run = paragraph.add_run()
             kwargs = {}
             if image.width_pt is not None:
@@ -633,8 +663,6 @@ def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None
                 pil_image.save(image_stream, format="PNG")
             image_stream.seek(0)
             run.add_picture(image_stream, **kwargs)
-        spacer = document.add_paragraph()
-        spacer.paragraph_format.space_after = Pt(0)
 
 
 def add_heading(document: Document, text: str, level: int) -> None:
@@ -721,18 +749,48 @@ def issue_item_key(item: str, categories: list[tuple[str, tuple[str, ...]]]) -> 
     return f"text:{item}"
 
 
+def image_row_signature(row: ImageRow) -> tuple[tuple[int, bytes], ...]:
+    return tuple((len(image.blob), image.blob[:32]) for image in row.images)
+
+
 def merge_street_records(records: list[DailyRecord], categories: list[tuple[str, tuple[str, ...]]]) -> list[MergedRecord]:
-    merged: dict[str, MergedRecord] = {}
-    seen_by_station: dict[str, set[str]] = defaultdict(set)
+    merged_items: dict[str, list[str]] = {}
+    merged_texts: dict[str, dict[str, str]] = {}
+    merged_images: dict[str, dict[str, tuple[ImageRow, ...]]] = {}
+
     for record in records:
-        target = merged.setdefault(record.station, MergedRecord(station=record.station, issue_texts=[], image_rows=[]))
+        issue_keys = merged_items.setdefault(record.station, [])
+        issue_texts = merged_texts.setdefault(record.station, {})
+        issue_images = merged_images.setdefault(record.station, {})
+
         for item in split_issue_items(record.issue_text):
             key = issue_item_key(item, categories)
-            if key not in seen_by_station[record.station]:
-                target.issue_texts.append(item)
-                seen_by_station[record.station].add(key)
-        target.image_rows.extend(record.image_rows)
-    return list(merged.values())
+            if key not in issue_texts:
+                issue_keys.append(key)
+                issue_texts[key] = item
+            # Records are sorted by date, so assignment keeps only the latest
+            # image rows for duplicated problem categories.
+            issue_images[key] = record.image_rows
+
+    result: list[MergedRecord] = []
+    for station, issue_keys in merged_items.items():
+        rows: list[ImageRow] = []
+        seen_rows: set[tuple[tuple[int, bytes], ...]] = set()
+        for key in issue_keys:
+            for row in merged_images.get(station, {}).get(key, ()):
+                signature = image_row_signature(row)
+                if signature in seen_rows:
+                    continue
+                rows.append(row)
+                seen_rows.add(signature)
+        result.append(
+            MergedRecord(
+                station=station,
+                issue_texts=[merged_texts[station][key] for key in issue_keys],
+                image_rows=rows,
+            )
+        )
+    return result
 
 
 def summarize_records(
@@ -750,17 +808,22 @@ def summarize_records(
     return dict(sorted(by_street.items())), dict(sorted(counts.items()))
 
 
-def build_summary_sentence(records: list[DailyRecord], year: int, month: int, profile: dict) -> str:
+def build_summary_sentence(
+    records: list[DailyRecord],
+    year: int,
+    month: int,
+    profile: dict,
+    street_count: int,
+) -> str:
     start, end = report_period(year, month)
-    streets = {record.street for record in records}
     problem_records = [record for record in records if is_body_record(record, profile)]
     start_label = format_date_cn(start)
     end_label = format_date_cn(end)
 
     if start_label == end_label:
-        prefix = f"{start_label}对本区{len(streets)}个街道{profile['subject']}进行了{len(records)}个次检查。"
+        prefix = f"{start_label}对本区{street_count}个街道{profile['subject']}进行了{len(records)}个次检查。"
     else:
-        prefix = f"{start_label}至{end_label}对本区{len(streets)}个街道{profile['subject']}进行了{len(records)}个次检查。"
+        prefix = f"{start_label}至{end_label}对本区{street_count}个街道{profile['subject']}进行了{len(records)}个次检查。"
 
     if not problem_records:
         return f"{prefix}除未开门运行情况外，检查未发现其他问题。"
@@ -822,10 +885,6 @@ def create_monthly_docx(records: list[DailyRecord], output_path: Path, year: int
     run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
     run.font.size = Pt(22)
 
-    add_heading(document, "一、总体情况", level=1)
-    add_paragraph(document, build_summary_sentence(records, year, month, profile))
-
-    add_heading(document, profile["detail_heading"], level=1)
     by_street, counts = summarize_records(
         [record for record in records if not is_unopened_record(record, profile)],
         categories,
@@ -839,13 +898,21 @@ def create_monthly_docx(records: list[DailyRecord], output_path: Path, year: int
         for street, street_records in streets_with_body_records
         if street_records
     ]
+
+    add_heading(document, "一、总体情况", level=1)
+    add_paragraph(document, build_summary_sentence(records, year, month, profile, len(streets_with_body_records)))
+
+    add_heading(document, profile["detail_heading"], level=1)
     if not streets_with_body_records:
         add_paragraph(document, "本月除未开门运行情况外，未发现需列入街道情况的其他问题。")
     for street_index, (street, street_records) in enumerate(streets_with_body_records, start=1):
         add_heading(document, f"（{chinese_section_number(street_index)}）{street}", level=2)
-        for merged_record in merge_street_records(street_records, categories):
+        merged_records = merge_street_records(street_records, categories)
+        use_station_numbers = len(merged_records) > 1
+        for station_index, merged_record in enumerate(merged_records, start=1):
             issue_text = format_issue_items(merged_record.issue_texts)
-            add_paragraph(document, f"{merged_record.station}：{issue_text}")
+            station_label = f"{station_index}.{merged_record.station}" if use_station_numbers else merged_record.station
+            add_paragraph(document, f"{station_label}：{issue_text}")
             add_image_rows(document, tuple(merged_record.image_rows))
 
     landscape = document.add_section(WD_ORIENT.LANDSCAPE)
@@ -871,6 +938,7 @@ def create_monthly_docx(records: list[DailyRecord], output_path: Path, year: int
 
     add_issue_table(document, counts, categories)
 
+    cleanup_empty_paragraphs(document)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     document.save(output_path)
     return output_path
