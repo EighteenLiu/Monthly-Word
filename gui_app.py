@@ -8,11 +8,15 @@ from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Entry, Frame, Label, StringVar, Tk, Text, filedialog, messagebox, ttk
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
+def get_project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
-from monthly_generator import (  # noqa: E402
+
+PROJECT_ROOT = get_project_root()
+
+from scripts.monthly_generator import (  # noqa: E402
     DEFAULT_CONVERTED_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RAW_INPUT_DIR,
@@ -39,6 +43,7 @@ class MonthlyReportApp:
         self.root.title("西城区月报生成工具")
         self.root.geometry("820x560")
         self.root.minsize(760, 500)
+        self.ensure_default_dirs()
 
         self.year_var = StringVar(value="2026")
         self.month_var = StringVar(value="5")
@@ -98,6 +103,16 @@ class MonthlyReportApp:
         self.log.pack(fill=BOTH, expand=True)
         self.write_log("请选择日报所在文件夹后点击“生成月报”。\n")
         self.write_log("文件夹可以选择 01_原始日报 根目录，也可以直接选择 清洁站 或 中转站 文件夹。\n")
+
+    def ensure_default_dirs(self) -> None:
+        for directory in (
+            DEFAULT_RAW_INPUT_DIR / "清洁站",
+            DEFAULT_RAW_INPUT_DIR / "中转站",
+            DEFAULT_CONVERTED_DIR / "清洁站",
+            DEFAULT_CONVERTED_DIR / "中转站",
+            DEFAULT_OUTPUT_DIR,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
 
     def add_labeled_entry(self, parent: Frame, label: str, variable: StringVar, width: int) -> None:
         box = Frame(parent)

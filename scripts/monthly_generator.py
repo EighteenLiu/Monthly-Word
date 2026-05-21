@@ -31,7 +31,13 @@ from docx.shared import Cm, Pt, RGBColor
 from PIL import Image
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def get_project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+PROJECT_ROOT = get_project_root()
 DEFAULT_RAW_INPUT_DIR = PROJECT_ROOT / "01_原始日报"
 DEFAULT_CONVERTED_DIR = PROJECT_ROOT / "02_转换后日报"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "04_输出月报"
