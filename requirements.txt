@@ -1,5 +1,6 @@
 lxml
 Pillow
 python-docx
+Jinja2
 pywin32; platform_system == "Windows"
 pyinstaller

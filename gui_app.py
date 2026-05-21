@@ -20,6 +20,7 @@ from scripts.monthly_generator import (  # noqa: E402
     DEFAULT_CONVERTED_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RAW_INPUT_DIR,
+    DEFAULT_TEMPLATE_DIR,
     generate_monthly_report,
     normalize_station_type,
 )
@@ -49,6 +50,7 @@ class MonthlyReportApp:
         self.month_var = StringVar(value="5")
         self.type_var = StringVar(value="1")
         self.raw_dir_var = StringVar(value=str(DEFAULT_RAW_INPUT_DIR))
+        self.template_path_var = StringVar(value="")
         self.output_dir_var = StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.status_var = StringVar(value="待运行")
         self.messages: queue.Queue[str] = queue.Queue()
@@ -87,6 +89,7 @@ class MonthlyReportApp:
         type_select.bind("<<ComboboxSelected>>", self.on_type_selected)
 
         self.add_folder_row(form, "日报所在文件夹", self.raw_dir_var, self.choose_raw_dir)
+        self.add_file_row(form, "月报docx模板", self.template_path_var, self.choose_template_file)
         self.add_folder_row(form, "月报输出文件夹", self.output_dir_var, self.choose_output_dir)
 
         actions = Frame(outer)
@@ -110,6 +113,7 @@ class MonthlyReportApp:
             DEFAULT_RAW_INPUT_DIR / "中转站",
             DEFAULT_CONVERTED_DIR / "清洁站",
             DEFAULT_CONVERTED_DIR / "中转站",
+            DEFAULT_TEMPLATE_DIR,
             DEFAULT_OUTPUT_DIR,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -121,6 +125,13 @@ class MonthlyReportApp:
         Entry(box, textvariable=variable, width=width).pack()
 
     def add_folder_row(self, parent: Frame, label: str, variable: StringVar, command) -> None:
+        row = Frame(parent)
+        row.pack(fill=X, pady=6)
+        Label(row, text=label, width=14, anchor="w").pack(side=LEFT)
+        Entry(row, textvariable=variable).pack(side=LEFT, fill=X, expand=True)
+        Button(row, text="选择", width=8, command=command).pack(side=LEFT, padx=(8, 0))
+
+    def add_file_row(self, parent: Frame, label: str, variable: StringVar, command) -> None:
         row = Frame(parent)
         row.pack(fill=X, pady=6)
         Label(row, text=label, width=14, anchor="w").pack(side=LEFT)
@@ -140,6 +151,15 @@ class MonthlyReportApp:
         selected = filedialog.askdirectory(title="选择月报输出文件夹", initialdir=self.output_dir_var.get() or str(PROJECT_ROOT))
         if selected:
             self.output_dir_var.set(selected)
+
+    def choose_template_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择月报docx模板",
+            initialdir=str(DEFAULT_TEMPLATE_DIR if DEFAULT_TEMPLATE_DIR.exists() else PROJECT_ROOT),
+            filetypes=(("Word 文档", "*.docx"), ("所有文件", "*.*")),
+        )
+        if selected:
+            self.template_path_var.set(selected)
 
     def clear_log(self) -> None:
         self.log.delete("1.0", END)
@@ -175,20 +195,33 @@ class MonthlyReportApp:
             return
 
         raw_dir = Path(self.raw_dir_var.get().strip())
+        template_path_text = self.template_path_var.get().strip()
+        template_path = Path(template_path_text) if template_path_text else None
         output_dir = Path(self.output_dir_var.get().strip())
         if not raw_dir.exists():
             messagebox.showerror("路径错误", "日报所在文件夹不存在。")
+            return
+        if template_path and not template_path.exists():
+            messagebox.showerror("路径错误", "月报docx模板不存在。")
             return
 
         self.status_var.set("运行中")
         self.generate_button.config(state="disabled")
         self.write_log("\n========== 开始生成 ==========\n")
 
-        args = (int(year), month, station_type, raw_dir, output_dir)
+        args = (int(year), month, station_type, raw_dir, output_dir, template_path)
         self.worker = threading.Thread(target=self.run_generation, args=args, daemon=True)
         self.worker.start()
 
-    def run_generation(self, year: int, month: str, station_type: str, raw_dir: Path, output_dir: Path) -> None:
+    def run_generation(
+        self,
+        year: int,
+        month: str,
+        station_type: str,
+        raw_dir: Path,
+        output_dir: Path,
+        template_path: Path | None,
+    ) -> None:
         original_stdout = sys.stdout
         sys.stdout = TextWriter(self.messages)
         try:
@@ -202,6 +235,7 @@ class MonthlyReportApp:
                 station_type=normalized_type,
                 engine="auto",
                 skip_convert=False,
+                template_path=template_path,
             )
             self.messages.put(f"\n[完成] 月报已生成：{output_path}\n")
             self.root.after(0, lambda: self.status_var.set("完成"))
