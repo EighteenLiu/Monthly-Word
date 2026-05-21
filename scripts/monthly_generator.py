@@ -714,13 +714,23 @@ def format_issue_items(items: list[str]) -> str:
     return "；".join(f"（{index}）{item}" for index, item in enumerate(unique_items, start=1)) + "。"
 
 
-def merge_street_records(records: list[DailyRecord]) -> list[MergedRecord]:
+def issue_item_key(item: str, categories: list[tuple[str, tuple[str, ...]]]) -> str:
+    for category, keywords in categories:
+        if any(keyword in item for keyword in keywords):
+            return f"category:{category}"
+    return f"text:{item}"
+
+
+def merge_street_records(records: list[DailyRecord], categories: list[tuple[str, tuple[str, ...]]]) -> list[MergedRecord]:
     merged: dict[str, MergedRecord] = {}
+    seen_by_station: dict[str, set[str]] = defaultdict(set)
     for record in records:
         target = merged.setdefault(record.station, MergedRecord(station=record.station, issue_texts=[], image_rows=[]))
         for item in split_issue_items(record.issue_text):
-            if item not in target.issue_texts:
+            key = issue_item_key(item, categories)
+            if key not in seen_by_station[record.station]:
                 target.issue_texts.append(item)
+                seen_by_station[record.station].add(key)
         target.image_rows.extend(record.image_rows)
     return list(merged.values())
 
@@ -833,7 +843,7 @@ def create_monthly_docx(records: list[DailyRecord], output_path: Path, year: int
         add_paragraph(document, "本月除未开门运行情况外，未发现需列入街道情况的其他问题。")
     for street_index, (street, street_records) in enumerate(streets_with_body_records, start=1):
         add_heading(document, f"（{chinese_section_number(street_index)}）{street}", level=2)
-        for merged_record in merge_street_records(street_records):
+        for merged_record in merge_street_records(street_records, categories):
             issue_text = format_issue_items(merged_record.issue_texts)
             add_paragraph(document, f"{merged_record.station}：{issue_text}")
             add_image_rows(document, tuple(merged_record.image_rows))
