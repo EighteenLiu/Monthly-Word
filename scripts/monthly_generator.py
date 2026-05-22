@@ -431,18 +431,32 @@ def parse_points_from_style(style: str) -> tuple[float | None, float | None]:
 
 def image_row_from_paragraph(document: Document, paragraph) -> ImageRow | None:
     images: list[ImageSpec] = []
+    seen_rids: set[str] = set()
     shapes = paragraph._p.xpath('.//*[local-name()="shape"]')
     for shape in shapes:
         image_data = shape.xpath('.//*[local-name()="imagedata"]')
         if not image_data:
             continue
         rid = image_data[0].get(qn("r:id"))
+        if not rid or rid in seen_rids:
+            continue
+        seen_rids.add(rid)
         style = shape.get("style", "")
         related_part = document.part.related_parts.get(rid)
         if related_part is None:
             continue
         width, height = parse_points_from_style(style)
         images.append(ImageSpec(blob=related_part.blob, width_pt=width, height_pt=height))
+    blips = paragraph._p.xpath('.//*[local-name()="blip"]')
+    for blip in blips:
+        rid = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
+        if not rid or rid in seen_rids:
+            continue
+        seen_rids.add(rid)
+        related_part = document.part.related_parts.get(rid)
+        if related_part is None:
+            continue
+        images.append(ImageSpec(blob=related_part.blob, width_pt=None, height_pt=None))
     if not images:
         return None
     return ImageRow(images=tuple(images), centered=paragraph.alignment == WD_ALIGN_PARAGRAPH.CENTER)
@@ -540,7 +554,7 @@ def parse_daily_report(path: Path, categories: list[tuple[str, tuple[str, ...]]]
         street, station = split_street_station(title)
         issue_text = normalize_issue_text("".join(issue_parts))
         detail_start = cursor + 1 if cursor < len(paragraphs) else cursor
-        detail_end = max(detail_start, next_overall_index(document.paragraphs, index) - 1)
+        detail_end = max(detail_start, next_overall_index(document.paragraphs, index))
         records.append(
             DailyRecord(
                 source=path,
@@ -697,7 +711,7 @@ def default_street_template_lines() -> list[str]:
         "{% for street in streets %}",
         "{{ street.heading }}",
         "{% for station in street.stations %}",
-        "{{ station.text }}",
+        "[[STATION:{{ station.key }}]]",
         "[[IMAGES:{{ station.image_key }}]]",
         "{% endfor %}",
         "{% endfor %}",
@@ -738,43 +752,38 @@ def build_template_context(
     records: list[DailyRecord],
     year: int,
     month: int,
+    station_type: str,
     profile: dict,
     categories: list[tuple[str, tuple[str, ...]]],
 ) -> tuple[dict, dict[str, tuple[ImageRow, ...]], dict[str, dict[str, int]]]:
-    by_street, counts = summarize_records(
-        [record for record in records if not is_unopened_record(record, profile)],
-        categories,
-    )
-    streets_with_body_records = [
-        (street, [record for record in street_records if is_body_record(record, profile)])
-        for street, street_records in by_street.items()
-    ]
-    streets_with_body_records = [
-        (street, street_records)
-        for street, street_records in streets_with_body_records
-        if street_records
-    ]
+    body_records = build_body_records(records, station_type, categories)
+    by_street, counts = summarize_records(body_records, categories)
 
     image_map: dict[str, tuple[ImageRow, ...]] = {}
+    station_map: dict[str, dict] = {}
     streets: list[dict] = []
-    for street_index, (street, street_records) in enumerate(streets_with_body_records, start=1):
-        merged_records = merge_street_records(street_records, categories)
-        use_station_numbers = len(merged_records) > 1
+    for street_index, (street, street_records) in enumerate(by_street.items(), start=1):
+        use_station_numbers = len(street_records) > 1
         stations: list[dict] = []
-        for station_index, merged_record in enumerate(merged_records, start=1):
-            issue_text = format_issue_items(merged_record.issue_texts)
-            station_label = f"{station_index}.{merged_record.station}" if use_station_numbers else merged_record.station
+        for station_index, record in enumerate(street_records, start=1):
+            issue_text, has_problem = format_station_issue_text(record)
+            station_label = format_station_label(record, station_index, use_station_numbers, station_type)
             image_key = f"s{street_index}_p{station_index}"
-            image_map[image_key] = tuple(merged_record.image_rows)
-            stations.append(
-                {
-                    "name": merged_record.station,
-                    "label": station_label,
-                    "issue_text": issue_text,
-                    "text": f"{station_label}：{issue_text}",
-                    "image_key": image_key,
-                }
+            station_key = image_key
+            image_map[image_key] = (
+                tuple(record.image_rows) if has_problem else limit_image_rows(tuple(record.image_rows), 3)
             )
+            station_data = {
+                "key": station_key,
+                "name": record.station,
+                "label": station_label,
+                "issue_text": issue_text,
+                "text": f"{station_label}：{issue_text}",
+                "image_key": image_key,
+                "has_problem": has_problem,
+            }
+            station_map[station_key] = station_data
+            stations.append(station_data)
         streets.append(
             {
                 "name": street,
@@ -788,10 +797,11 @@ def build_template_context(
     context = {
         "title": profile["title"],
         "summary_heading": "一、总体情况",
-        "summary": build_summary_sentence(records, year, month, profile, len(streets_with_body_records)),
+        "summary": build_summary_sentence(body_records, year, month, profile, len(by_street)),
         "detail_heading": profile["detail_heading"],
-        "no_detail_text": "本月除未开门运行情况外，未发现需列入街道情况的其他问题。",
+        "no_detail_text": "本月未发现需列入街道情况的站点。",
         "streets": streets,
+        "station_map": station_map,
         "start_date": format_date_cn(start),
         "end_date": format_date_cn(end),
         "year": year,
@@ -808,6 +818,12 @@ def render_jinja_body(document: Document, jinja_path: Path | None, context: dict
     for raw_line in rendered.splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        station_match = re.fullmatch(r"\[\[STATION:(?P<key>[A-Za-z0-9_:-]+)\]\]", line)
+        if station_match:
+            station = context["station_map"].get(station_match.group("key"))
+            if station:
+                add_station_paragraph(document, station["label"], station["issue_text"], station["has_problem"])
             continue
         image_match = re.fullmatch(r"\[\[IMAGES:(?P<key>[A-Za-z0-9_:-]+)\]\]", line)
         if image_match:
@@ -847,12 +863,21 @@ def configure_styles(document: Document) -> None:
 
     heading2 = get_or_create_paragraph_style(document, ("Heading 2", "标题 2", "标题2", "Heading2"), "Heading 2")
     if heading2:
-        heading2.font.name = "黑体"
-        heading2._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+        heading2.font.name = "楷体_GB2312"
+        heading2._element.rPr.rFonts.set(qn("w:eastAsia"), "楷体_GB2312")
         heading2.font.size = Pt(16)
         heading2.font.bold = True
         heading2.font.color.rgb = RGBColor(0, 0, 0)
         set_style_outline_level(heading2, 1)
+
+    heading3 = get_or_create_paragraph_style(document, ("Heading 3", "标题 3", "标题3", "Heading3"), "Heading 3")
+    if heading3:
+        heading3.font.name = "仿宋"
+        heading3._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+        heading3.font.size = Pt(16)
+        heading3.font.bold = False
+        heading3.font.color.rgb = RGBColor(0, 0, 0)
+        set_style_outline_level(heading3, 2)
 
 
 def get_first_style(document: Document, names: tuple[str, ...]):
@@ -909,10 +934,30 @@ def add_paragraph(document: Document, text: str, *, bold: bool = False, align=No
     run.font.size = Pt(16)
 
 
+def add_station_paragraph(document: Document, label: str, issue_text: str, has_problem: bool) -> None:
+    paragraph = document.add_paragraph(style=get_heading_style_name(document, 3))
+    paragraph.paragraph_format.first_line_indent = Cm(0.74)
+    paragraph.paragraph_format.line_spacing = 1.5
+    paragraph.paragraph_format.space_after = Pt(0)
+
+    label_run = paragraph.add_run(f"{label}：")
+    label_run.font.name = "仿宋"
+    label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+    label_run.font.size = Pt(16)
+
+    issue_run = paragraph.add_run(issue_text)
+    issue_run.font.name = "仿宋"
+    issue_run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+    issue_run.font.size = Pt(16)
+    if has_problem:
+        issue_run.font.color.rgb = RGBColor(255, 0, 0)
+
+
 def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None:
     images = [image for image_row in image_rows for image in image_row.images]
-    for index in range(0, len(images), 2):
-        row_images = images[index : index + 2]
+    image_width = Cm(4.55)
+    for index in range(0, len(images), 3):
+        row_images = images[index : index + 3]
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.line_spacing = 1.0
@@ -920,16 +965,11 @@ def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None
         paragraph.paragraph_format.space_after = Pt(0)
         for image in row_images:
             run = paragraph.add_run()
-            kwargs = {}
-            if image.width_pt is not None:
-                kwargs["width"] = Pt(image.width_pt)
-            if image.height_pt is not None:
-                kwargs["height"] = Pt(image.height_pt)
             image_stream = io.BytesIO()
             with Image.open(io.BytesIO(image.blob)) as pil_image:
                 pil_image.save(image_stream, format="PNG")
             image_stream.seek(0)
-            run.add_picture(image_stream, **kwargs)
+            run.add_picture(image_stream, width=image_width)
 
 
 def add_heading(document: Document, text: str, level: int) -> None:
@@ -940,8 +980,9 @@ def add_heading(document: Document, text: str, level: int) -> None:
     paragraph.paragraph_format.space_after = Pt(0)
     run = paragraph.add_run(text)
     run.bold = True
-    run.font.name = "黑体"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+    font_name = "楷体_GB2312" if level == 2 else "仿宋" if level == 3 else "黑体"
+    run.font.name = font_name
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
     run.font.size = Pt(16)
     run.font.color.rgb = RGBColor(0, 0, 0)
 
@@ -970,6 +1011,43 @@ def is_body_record(record: DailyRecord, profile: dict) -> bool:
     ):
         return False
     return True
+
+
+def record_has_report_problem(record: DailyRecord) -> bool:
+    return sum(record.issue_counts.values()) > 0
+
+
+def format_station_issue_text(record: DailyRecord) -> tuple[str, bool]:
+    if record_has_report_problem(record):
+        return format_issue_items(split_issue_items(record.issue_text)), True
+    return normalize_issue_text(record.issue_text), False
+
+
+def format_record_date_code(record: DailyRecord) -> str:
+    return f"{record.month:02d}{record.day:02d}"
+
+
+def format_station_label(record: DailyRecord, station_index: int, use_station_numbers: bool, station_type: str) -> str:
+    if normalize_station_type(station_type) == "中转站":
+        return f"{record.station}（{format_record_date_code(record)}）"
+    return f"{station_index}.{record.station}" if use_station_numbers else record.station
+
+
+def build_body_records(
+    records: list[DailyRecord],
+    station_type: str,
+    categories: list[tuple[str, tuple[str, ...]]],
+) -> list[DailyRecord]:
+    if normalize_station_type(station_type) == "中转站":
+        return sorted(records, key=lambda record: (record.street, record.month, record.day, record.station))
+    return select_latest_station_records(records, categories)
+
+
+def limit_image_rows(image_rows: tuple[ImageRow, ...], max_images: int) -> tuple[ImageRow, ...]:
+    images = [image for image_row in image_rows for image in image_row.images][:max_images]
+    if not images:
+        return ()
+    return (ImageRow(images=tuple(images)),)
 
 
 def normalize_display_issue_text(text: str) -> str:
@@ -1060,6 +1138,16 @@ def merge_street_records(records: list[DailyRecord], categories: list[tuple[str,
     return result
 
 
+def select_latest_station_records(
+    records: list[DailyRecord],
+    categories: list[tuple[str, tuple[str, ...]]],
+) -> list[DailyRecord]:
+    latest: dict[tuple[str, str], DailyRecord] = {}
+    for record in records:
+        latest[(record.street, record.station)] = record
+    return sorted(latest.values(), key=lambda record: (record.street, record.station))
+
+
 def summarize_records(
     records: list[DailyRecord],
     categories: list[tuple[str, tuple[str, ...]]],
@@ -1083,7 +1171,7 @@ def build_summary_sentence(
     street_count: int,
 ) -> str:
     start, end = report_period(year, month)
-    problem_records = [record for record in records if is_body_record(record, profile)]
+    problem_records = [record for record in records if record_has_report_problem(record)]
     start_label = format_date_cn(start)
     end_label = format_date_cn(end)
 
@@ -1149,7 +1237,7 @@ def create_monthly_docx(
 
     configure_portrait_a4_section(document.sections[0])
 
-    context, image_map, counts = build_template_context(records, year, month, profile, categories)
+    context, image_map, counts = build_template_context(records, year, month, station_type, profile, categories)
     render_jinja_body(document, jinja_path, context, image_map)
 
     landscape = document.add_section(WD_ORIENT.LANDSCAPE)
