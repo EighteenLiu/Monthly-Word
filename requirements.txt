@@ -2,5 +2,11 @@ lxml
 Pillow
 python-docx
 Jinja2
+docxtpl
+fastapi
+uvicorn[standard]
+python-multipart
+openpyxl
+xlrd
 pywin32; platform_system == "Windows"
 pyinstaller

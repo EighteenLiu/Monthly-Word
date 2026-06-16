@@ -1,0 +1,318 @@
+:root {
+  --bg: #f5f7fa;
+  --panel: #ffffff;
+  --ink: #17202a;
+  --muted: #637083;
+  --line: #d8dee8;
+  --blue: #2563eb;
+  --blue-dark: #1d4ed8;
+  --green: #0f766e;
+  --amber: #9a6700;
+  --red: #b42318;
+  --shadow: 0 12px 32px rgba(23, 32, 42, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 20px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin: 0 auto 16px;
+  max-width: 1320px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 24px;
+  line-height: 1.25;
+  font-weight: 700;
+}
+
+h2 {
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.topbar p,
+#previewSubtitle {
+  color: var(--muted);
+  margin-top: 6px;
+  font-size: 14px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: 330px minmax(0, 1fr);
+  gap: 16px;
+  max-width: 1320px;
+  margin: 0 auto;
+  align-items: start;
+}
+
+.control-panel,
+.main-panel,
+.panel-block,
+.metric,
+.log-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.control-panel {
+  display: grid;
+  gap: 12px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.panel-block {
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.file-field,
+.select-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.file-field input,
+.select-field select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  padding: 9px 10px;
+}
+
+.toggle-group {
+  display: grid;
+  gap: 8px;
+  color: var(--ink);
+}
+
+.toggle-group label,
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.primary-button,
+.secondary-button,
+.ghost-button,
+.download-link {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 9px 13px;
+  cursor: pointer;
+  text-decoration: none;
+  text-align: center;
+  min-height: 38px;
+}
+
+.primary-button {
+  background: var(--blue);
+  color: white;
+}
+
+.primary-button:hover {
+  background: var(--blue-dark);
+}
+
+.secondary-button {
+  border-color: var(--blue);
+  background: #eff6ff;
+  color: var(--blue-dark);
+}
+
+.ghost-button {
+  border-color: var(--line);
+  background: #fff;
+  color: var(--ink);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.main-panel {
+  padding: 16px;
+  display: grid;
+  gap: 16px;
+}
+
+.metric-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric {
+  padding: 14px;
+}
+
+.metric-label {
+  color: var(--muted);
+  display: block;
+  font-size: 13px;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 26px;
+  line-height: 1;
+}
+
+.result-bar,
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.download-link {
+  background: var(--green);
+  color: white;
+  min-width: 110px;
+}
+
+.warning-box {
+  border: 1px solid #f4c766;
+  background: #fff8e6;
+  color: var(--amber);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  font-size: 14px;
+}
+
+th {
+  background: #eef2f7;
+  color: #344054;
+  font-weight: 700;
+}
+
+tbody tr:hover {
+  background: #f8fafc;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 4px;
+  padding: 2px 8px;
+  background: #e8f3f1;
+  color: var(--green);
+  font-size: 12px;
+}
+
+.log-panel {
+  padding: 14px;
+}
+
+#logOutput {
+  min-height: 130px;
+  max-height: 260px;
+  overflow: auto;
+  margin: 12px 0 0;
+  padding: 12px;
+  border-radius: 6px;
+  background: #111827;
+  color: #d1d5db;
+  white-space: pre-wrap;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+}
+
+.hidden {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .app-shell {
+    padding: 12px;
+  }
+
+  .topbar,
+  .result-bar,
+  .log-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  h1 {
+    font-size: 20px;
+  }
+}
+

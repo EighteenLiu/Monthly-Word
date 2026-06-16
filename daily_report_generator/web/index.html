@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>日报生成系统</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>中转站、密闭式清洁站日报生成系统</h1>
+          <p id="sessionText">等待上传台账</p>
+        </div>
+        <button id="resetBtn" class="ghost-button" type="button">重置</button>
+      </header>
+
+      <section class="workspace">
+        <aside class="control-panel">
+          <form id="uploadForm" class="panel-block">
+            <h2>文件上传</h2>
+            <label class="file-field">
+              <span>检查台账</span>
+              <input id="ledgerInput" name="ledger" type="file" accept=".xls,.xlsx" required />
+            </label>
+            <label class="file-field">
+              <span>中转站模板</span>
+              <input id="transferTemplateInput" name="transfer_template" type="file" accept=".docx" />
+            </label>
+            <label class="file-field">
+              <span>清洁站模板</span>
+              <input id="cleanTemplateInput" name="clean_template" type="file" accept=".docx" />
+            </label>
+            <button id="uploadBtn" class="primary-button" type="submit">上传并解析</button>
+          </form>
+
+          <form id="generateForm" class="panel-block">
+            <h2>生成参数</h2>
+            <label class="select-field">
+              <span>检查日期</span>
+              <select id="dateSelect" disabled></select>
+            </label>
+            <div class="toggle-group" aria-label="日报类型">
+              <label><input id="typeTransfer" type="checkbox" value="transfer" checked /> 中转站</label>
+              <label><input id="typeClean" type="checkbox" value="clean" checked /> 密闭式清洁站</label>
+            </div>
+            <label class="switch-row">
+              <input id="zipToggle" type="checkbox" checked />
+              <span>打包 zip</span>
+            </label>
+            <button id="previewBtn" class="secondary-button" type="button" disabled>刷新预览</button>
+            <button id="generateBtn" class="primary-button" type="submit" disabled>生成日报</button>
+          </form>
+        </aside>
+
+        <section class="main-panel">
+          <div class="metric-row">
+            <div class="metric">
+              <span class="metric-label">记录数</span>
+              <strong id="recordCount">0</strong>
+            </div>
+            <div class="metric">
+              <span class="metric-label">站点数</span>
+              <strong id="stationCount">0</strong>
+            </div>
+            <div class="metric">
+              <span class="metric-label">检查项</span>
+              <strong id="itemCount">0</strong>
+            </div>
+            <div class="metric">
+              <span class="metric-label">照片</span>
+              <strong id="photoCount">0</strong>
+            </div>
+          </div>
+
+          <div class="result-bar">
+            <div>
+              <h2>数据预览</h2>
+              <p id="previewSubtitle">选择日期后显示当天聚合结果</p>
+            </div>
+            <a id="downloadLink" class="download-link hidden" href="#">下载结果</a>
+          </div>
+
+          <div id="warningBox" class="warning-box hidden"></div>
+          <div id="previewTable" class="table-wrap"></div>
+          <div class="log-panel">
+            <div class="log-head">
+              <h2>运行日志</h2>
+              <button id="clearLogBtn" type="button" class="ghost-button">清空</button>
+            </div>
+            <pre id="logOutput"></pre>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

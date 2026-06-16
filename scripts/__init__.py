@@ -1,0 +1,1 @@
+"""Monthly report generation package."""
