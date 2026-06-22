@@ -50,6 +50,7 @@ A4_WIDTH = Cm(21)
 A4_HEIGHT = Cm(29.7)
 
 DAILY_NAME_RE = re.compile(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
+DAILY_CODE_RE = re.compile(r"(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})")
 
 CLEANING_ISSUE_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
     ("无称重系统或称重系统损坏", ("无称重系统", "称重系统损坏", "无称重", "称重设备损坏", "称重屏幕破损")),
@@ -162,7 +163,17 @@ def iter_doc_files(input_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in input_dir.rglob("*.doc")
-        if path.is_file() and path.suffix.lower() == ".doc"
+        if path.is_file() and path.suffix.lower() == ".doc" and not path.name.startswith("~$")
+    )
+
+
+def iter_docx_files(input_dir: Path) -> list[Path]:
+    if not input_dir.exists():
+        return []
+    return sorted(
+        path
+        for path in input_dir.rglob("*.docx")
+        if path.is_file() and path.suffix.lower() == ".docx" and not path.name.startswith("~$")
     )
 
 
@@ -257,14 +268,13 @@ def ensure_converted(
     engine: str = "auto",
 ) -> ConversionSummary:
     station_type = normalize_station_type(station_type)
-    source_root = raw_input_dir / station_type
-    if not source_root.exists() and raw_input_dir.name == station_type:
-        source_root = raw_input_dir
     target_root = converted_dir / station_type
     summary = ConversionSummary()
 
-    for source in iter_doc_files(source_root):
-        relative = source.relative_to(source_root)
+    for source in iter_doc_files(raw_input_dir):
+        if not path_matches_station_type(source, station_type):
+            continue
+        relative = source.relative_to(raw_input_dir)
         target = (target_root / relative).with_suffix(".docx")
         try:
             was_converted = convert_one(source, target, engine)
@@ -283,7 +293,11 @@ def ensure_converted(
     if summary.converted:
         print(f"[完成] 本次新转换 {summary.converted} 个日报")
     if not summary.converted and not summary.skipped:
-        print(f"[提示] 未发现原始 .doc 日报：{source_root}")
+        matching_docx = [path for path in iter_docx_files(raw_input_dir) if path_matches_station_type(path, station_type)]
+        if matching_docx:
+            print(f"[提示] 未发现原始 .doc 日报，将直接汇总 {len(matching_docx)} 个已生成 .docx 日报")
+        else:
+            print(f"[提示] 未发现 {station_type} 原始 .doc 或已生成 .docx 日报：{raw_input_dir}")
     return summary
 
 
@@ -335,9 +349,12 @@ def format_date_cn(value: date) -> str:
 
 def daily_date_from_name(path: Path) -> tuple[int, int] | None:
     match = DAILY_NAME_RE.search(path.stem)
-    if not match:
-        return None
-    return int(match.group("month")), int(match.group("day"))
+    if match:
+        return int(match.group("month")), int(match.group("day"))
+    match = DAILY_CODE_RE.search(path.stem)
+    if match:
+        return int(match.group("month")), int(match.group("day"))
+    return None
 
 
 def normalize_issue_text(text: str) -> str:
@@ -385,6 +402,24 @@ def normalize_station_type(station_type: str) -> str:
         "recycle": "中转站",
     }
     return aliases.get(station_type, station_type)
+
+
+def infer_station_type_from_path(path: Path) -> str | None:
+    filename = path.name
+    if "密闭式清洁站" in filename or "清洁站" in filename:
+        return "清洁站"
+    if "中转站" in filename or "可回收物中转站" in filename:
+        return "中转站"
+    for part in reversed(path.parts[:-1]):
+        if part in {"清洁站", "密闭式清洁站"}:
+            return "清洁站"
+        if part in {"中转站", "可回收物中转站"}:
+            return "中转站"
+    return None
+
+
+def path_matches_station_type(path: Path, station_type: str) -> bool:
+    return infer_station_type_from_path(path) == normalize_station_type(station_type)
 
 
 def count_issue_categories(issue_text: str, categories: list[tuple[str, tuple[str, ...]]]) -> dict[str, int]:
@@ -570,13 +605,25 @@ def parse_daily_report(path: Path, categories: list[tuple[str, tuple[str, ...]]]
     return records
 
 
-def collect_records(converted_dir: Path, station_type: str, year: int, month: int) -> list[DailyRecord]:
+def collect_records(source_dirs: Path | list[Path], station_type: str, year: int, month: int) -> list[DailyRecord]:
     station_type = normalize_station_type(station_type)
-    source_dir = converted_dir / station_type
+    if isinstance(source_dirs, Path):
+        source_dirs = [source_dirs]
     categories = get_station_profile(station_type)["categories"]
     start, end = report_period(year, month)
     records: list[DailyRecord] = []
-    for path in sorted(source_dir.glob("*.docx")):
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for source_dir in source_dirs:
+        for path in iter_docx_files(source_dir):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(path)
+    for path in sorted(paths):
+        if not path_matches_station_type(path, station_type):
+            continue
         parsed_date = daily_date_from_name(path)
         if parsed_date is None:
             continue
@@ -1279,13 +1326,18 @@ def generate_monthly_report(
     report_month = parse_month(month)
     report_year = parse_year(year, month)
 
+    matching_doc_sources = [path for path in iter_doc_files(raw_input_dir) if path_matches_station_type(path, station_type)]
+
     if not skip_convert:
         summary = ensure_converted(raw_input_dir, converted_dir, station_type, engine)
         if summary.failed:
             messages = "\n".join(f"{path}: {error}" for path, error in summary.failed)
             raise ConversionError(f"部分日报转换失败：\n{messages}")
 
-    records = collect_records(converted_dir, station_type, report_year, report_month)
+    record_sources = [raw_input_dir]
+    if matching_doc_sources:
+        record_sources.append(converted_dir / station_type)
+    records = collect_records(record_sources, station_type, report_year, report_month)
     profile = get_station_profile(station_type)
     output_path = output_dir / profile["output_name"].format(year=report_year, month=report_month)
     return create_monthly_docx(records, output_path, report_year, report_month, station_type, template_path)

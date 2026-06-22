@@ -10,12 +10,13 @@ from docx.shared import Cm
 
 from .aggregator import result_for_type
 from .models import AggregationResult, StationItem, StationSummary
-from .normalizer import CLEAN_TYPE, TRANSFER_TYPE, chinese_section_number, level4_point_display_name
+from .normalizer import CLEAN_TYPE, TRANSFER_TYPE, chinese_section_number, is_no_problem_text, level4_point_display_name
 from .transfer_station_mapping import TRANSFER_STATION_DETAIL_MAPPING
 
 
 PHOTO_WIDTH = Cm(7.22)
 PHOTO_HEIGHT = Cm(5.72)
+NO_PROBLEM_PHOTO_LIMIT = 4
 
 
 def render_reports(
@@ -130,6 +131,18 @@ def item_context_text(item: SimpleNamespace) -> str:
     return "|".join(norm_text(part) for part in parts if part)
 
 
+def is_no_problem_item(item: SimpleNamespace) -> bool:
+    return any(
+        is_no_problem_text(str(value))
+        for value in (
+            getattr(item, "indicator_name", ""),
+            getattr(item, "result", ""),
+            getattr(item, "issue_text", ""),
+            getattr(item, "name", ""),
+        )
+    )
+
+
 def is_item_match(item: SimpleNamespace, config: dict) -> bool:
     exact_fields = {
         norm_text(getattr(item, "indicator_name", "")),
@@ -178,6 +191,27 @@ def build_transfer_station_detail_items(items: list[SimpleNamespace], show_empty
                     name=config["name"],
                     photos=matched_photos,
                     photo_rows=make_photo_rows(matched_photos),
+                )
+            )
+    for item in items:
+        if not is_no_problem_item(item):
+            continue
+        fallback_photos: list[InlineImage] = []
+        for photo_index, photo in enumerate(getattr(item, "photos", [])):
+            photo_paths = getattr(item, "photo_paths", [])
+            photo_id = str(photo_paths[photo_index]) if photo_index < len(photo_paths) else f"{id(item)}:{photo_index}"
+            if photo_id in used_photo_ids:
+                continue
+            fallback_photos.append(photo)
+            used_photo_ids.add(photo_id)
+            if len(fallback_photos) >= NO_PROBLEM_PHOTO_LIMIT:
+                break
+        if fallback_photos:
+            detail_items.append(
+                SimpleNamespace(
+                    name=getattr(item, "name", "") or "无问题",
+                    photos=fallback_photos,
+                    photo_rows=make_photo_rows(fallback_photos),
                 )
             )
     return detail_items

@@ -16,11 +16,10 @@ from tkinter import (
     X,
     BooleanVar,
     Button,
+    Canvas,
     Entry,
     Frame,
     Label,
-    Listbox,
-    EXTENDED,
     StringVar,
     Tk,
     Text,
@@ -81,6 +80,9 @@ class ReportToolApp:
         self.status_var = StringVar(value="待运行")
         self.daily_preview_text = StringVar(value="未解析日期")
         self.daily_available_dates: list[tuple[str, int]] = []
+        self.daily_date_vars: list[tuple[str, BooleanVar]] = []
+        self.daily_select_all_var = BooleanVar(value=True)
+        self.syncing_daily_dates = False
 
         self.init_variables()
         self.ensure_default_dirs()
@@ -166,9 +168,34 @@ class ReportToolApp:
         self.generate_daily_button.pack(side=LEFT, padx=(10, 0))
 
         Label(parent, textvariable=self.daily_preview_text, fg="#374151").pack(anchor="w")
-        Label(parent, text="检查日期（可按 Ctrl 或 Shift 多选）").pack(anchor="w", pady=(4, 0))
-        self.daily_date_list = Listbox(parent, height=4, selectmode=EXTENDED, exportselection=False)
-        self.daily_date_list.pack(fill=X, pady=(3, 4))
+        date_header = Frame(parent)
+        date_header.pack(fill=X, pady=(4, 0))
+        Label(date_header, text="检查日期").pack(side=LEFT)
+        ttk.Checkbutton(
+            date_header,
+            text="全选",
+            variable=self.daily_select_all_var,
+            command=self.toggle_all_daily_dates,
+        ).pack(side=LEFT, padx=(12, 0))
+        daily_date_box = Frame(parent)
+        daily_date_box.pack(fill=X, pady=(3, 4))
+        self.daily_date_canvas = Canvas(daily_date_box, height=112, highlightthickness=1, highlightbackground="#d1d5db")
+        daily_date_scrollbar = ttk.Scrollbar(daily_date_box, orient="vertical", command=self.daily_date_canvas.yview)
+        self.daily_date_canvas.configure(yscrollcommand=daily_date_scrollbar.set)
+        self.daily_date_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        daily_date_scrollbar.pack(side=RIGHT, fill="y")
+        self.daily_date_frame = Frame(self.daily_date_canvas)
+        self.daily_date_window = self.daily_date_canvas.create_window((0, 0), window=self.daily_date_frame, anchor="nw")
+        self.daily_date_frame.bind(
+            "<Configure>",
+            lambda _event: self.daily_date_canvas.configure(scrollregion=self.daily_date_canvas.bbox("all")),
+        )
+        self.daily_date_canvas.bind(
+            "<Configure>",
+            lambda event: self.daily_date_canvas.itemconfigure(self.daily_date_window, width=event.width),
+        )
+        self.daily_date_canvas.bind("<Enter>", self.bind_daily_date_wheel)
+        self.daily_date_canvas.bind("<Leave>", self.unbind_daily_date_wheel)
 
     def build_monthly_tab(self, parent: Frame) -> None:
         Label(parent, text="从已转换日报汇总生成月报", font=("Microsoft YaHei", 12, "bold")).pack(anchor="w")
@@ -315,20 +342,44 @@ class ReportToolApp:
 
     def set_daily_dates(self, dates: list[tuple[str, int]]) -> None:
         self.daily_available_dates = dates
-        values = [f"{item[0]}（{item[1]} 条）" for item in dates]
-        self.daily_date_list.delete(0, END)
-        for value in values:
-            self.daily_date_list.insert(END, value)
-        if values:
-            self.daily_date_list.selection_set(0, END)
-            self.daily_preview_text.set(f"已识别 {len(values)} 个检查日期")
+        self.daily_date_vars = []
+        for child in self.daily_date_frame.winfo_children():
+            child.destroy()
+
+        self.daily_select_all_var.set(bool(dates))
+        for iso_date, count in dates:
+            selected = BooleanVar(value=True)
+            self.daily_date_vars.append((iso_date, selected))
+            ttk.Checkbutton(
+                self.daily_date_frame,
+                text=f"{iso_date}（{count} 条）",
+                variable=selected,
+                command=self.update_daily_select_all,
+            ).pack(anchor="w")
+
+        if dates:
+            self.daily_preview_text.set(f"已识别 {len(dates)} 个检查日期，默认全部勾选")
         else:
             self.daily_preview_text.set("未识别到可用日期")
 
     def selected_daily_dates(self) -> list[date]:
-        selected_indexes = self.daily_date_list.curselection()
-        values = [self.daily_date_list.get(index) for index in selected_indexes]
-        return [date.fromisoformat(value.split("（", 1)[0]) for value in values]
+        return [date.fromisoformat(value) for value, selected in self.daily_date_vars if selected.get()]
+
+    def toggle_all_daily_dates(self) -> None:
+        if self.syncing_daily_dates:
+            return
+        self.syncing_daily_dates = True
+        selected = self.daily_select_all_var.get()
+        for _, variable in self.daily_date_vars:
+            variable.set(selected)
+        self.syncing_daily_dates = False
+
+    def update_daily_select_all(self) -> None:
+        if self.syncing_daily_dates:
+            return
+        self.syncing_daily_dates = True
+        self.daily_select_all_var.set(bool(self.daily_date_vars) and all(variable.get() for _, variable in self.daily_date_vars))
+        self.syncing_daily_dates = False
 
     def selected_daily_types(self) -> list[str]:
         types: list[str] = []
@@ -362,8 +413,9 @@ class ReportToolApp:
         if CLEAN_TYPE in types and (not clean_template or not clean_template.exists()):
             messagebox.showerror("路径错误", "密闭式清洁站模板不存在。")
             return
-        self.status_var.set("生成日报中")
+        self.status_var.set("正在生成")
         self.set_daily_buttons("disabled")
+        self.generate_daily_button.config(text="正在生成")
         self.write_log("\n========== 开始生成日报 ==========\n")
         args = (ledger_path, selected_dates, types, transfer_template, clean_template, output_dir)
         self.worker = threading.Thread(target=self.run_daily_generation, args=args, daemon=True)
@@ -415,6 +467,19 @@ class ReportToolApp:
     def set_daily_buttons(self, state: str) -> None:
         for button in (self.parse_daily_button, self.generate_daily_button):
             button.config(state=state)
+        if state == "normal":
+            self.generate_daily_button.config(text="生成日报")
+
+    def bind_daily_date_wheel(self, _event: object) -> None:
+        self.root.bind_all("<MouseWheel>", self.scroll_daily_dates)
+
+    def unbind_daily_date_wheel(self, _event: object) -> None:
+        self.root.unbind_all("<MouseWheel>")
+
+    def scroll_daily_dates(self, event: object) -> None:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self.daily_date_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
 
     def start_monthly_generation(self) -> None:
         if not self.ensure_not_running("月报生成"):
