@@ -15,7 +15,7 @@
 - 支持一次选择多个日期批量生成日报。
 - 支持同时勾选中转站和密闭式清洁站；若某天某类没有数据，会自动跳过，不报错。
 - 生成日报时才转换 `.xls`、抽取嵌入图片、按行列锚点映射照片。
-- 每个日期单独输出到 `daily_report_generator/output/yyyyMMdd/`。
+- 日报按类型输出到 `output/日报/清洁站/` 和 `output/日报/中转站/`。
 
 ### 月报生成
 
@@ -62,8 +62,8 @@ run_gui.bat
 输出示例：
 
 ```text
-daily_report_generator/output/20260605/20260605_中转站检查情况.docx
-daily_report_generator/output/20260606/20260606_密闭式清洁站检查情况.docx
+output/日报/中转站/6月5日中转站检查情况.docx
+output/日报/清洁站/6月6日密闭式清洁站检查情况.docx
 ```
 
 默认日报模板位于：

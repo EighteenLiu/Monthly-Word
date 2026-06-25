@@ -50,14 +50,16 @@ def read_ledger_dates(path: Path) -> dict[date, int]:
     raw_headers = [clean_cell(value) for value in rows[1]]
     headers = [header or group_headers[index] for index, header in enumerate(raw_headers)]
     field_indexes = build_field_indexes(group_headers, headers)
-    created_index = field_indexes.get("created_time")
-    if created_index is None:
-        raise ValueError("台账缺少日期字段：创建时间")
+    date_index = field_indexes.get("created_time")
+    if date_index is None:
+        date_index = field_indexes.get("report_time")
+    if date_index is None:
+        raise ValueError("台账缺少日期字段：创建时间或案件上报时间")
 
     available_dates: dict[date, int] = {}
     for row in rows[2:]:
-        created_value = row[int(created_index)] if created_index is not None and int(created_index) < len(row) else ""
-        parsed_datetime = parse_datetime_like(created_value)
+        date_value = row[int(date_index)] if date_index is not None and int(date_index) < len(row) else ""
+        parsed_datetime = parse_datetime_like(date_value)
         parsed_date = report_date_from_created_time(parsed_datetime)
         if parsed_date:
             available_dates[parsed_date] = available_dates.get(parsed_date, 0) + 1
@@ -142,7 +144,8 @@ def build_field_indexes(group_headers: list[str], headers: list[str]) -> dict[st
         "report_time": first_named("案件上报时间"),
         "created_time": first_named("创建时间"),
     }
-    missing = [name for name, index in required.items() if index is None and name not in {"report_time", "created_time"}]
+    optional_fields = {"report_time", "created_time", "indicator_result"}
+    missing = [name for name, index in required.items() if index is None and name not in optional_fields]
     if missing:
         labels = {
             "serial_no": "编号",
@@ -156,6 +159,8 @@ def build_field_indexes(group_headers: list[str], headers: list[str]) -> dict[st
             "indicator_result": "3级指标",
         }
         raise ValueError("台账缺少必要字段：" + "、".join(labels[name] for name in missing))
+    if required["created_time"] is None and required["report_time"] is None:
+        raise ValueError("台账缺少必要字段：创建时间或案件上报时间")
 
     problem_photo_columns = [
         index
@@ -186,7 +191,7 @@ def build_records(
             continue
         created_time = parse_datetime_like(value(row, "created_time"))
         report_time = parse_datetime_like(value(row, "report_time"))
-        check_date = report_date_from_created_time(created_time)
+        check_date = report_date_from_created_time(created_time or report_time)
         row_images = sorted(
             [image for image in image_map.get(offset, []) if image.column_index in problem_photo_columns],
             key=lambda image: image.column_index,

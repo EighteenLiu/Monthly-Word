@@ -19,6 +19,11 @@ PHOTO_HEIGHT = Cm(5.72)
 NO_PROBLEM_PHOTO_LIMIT = 4
 
 
+def output_dir_for_type(output_root: Path, station_type: str) -> Path:
+    folder_name = "清洁站" if station_type == CLEAN_TYPE else station_type
+    return output_root / folder_name
+
+
 def render_reports(
     result: AggregationResult,
     transfer_template: Path | None,
@@ -26,21 +31,21 @@ def render_reports(
     output_root: Path,
     types: list[str],
 ) -> list[Path]:
-    output_dir = output_root / result.report_date_code
-    output_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
     for station_type in types:
         if not result_for_type(result, station_type):
             continue
+        output_dir = output_dir_for_type(output_root, station_type)
+        output_dir.mkdir(parents=True, exist_ok=True)
         if station_type == TRANSFER_TYPE:
             if not transfer_template:
                 raise ValueError("生成中转站日报需要上传中转站模板")
-            output = output_dir / f"{result.report_date_code}_中转站检查情况.docx"
+            output = output_dir / f"{result.report_date_text}中转站检查情况.docx"
             render_one(result, station_type, transfer_template, output)
         elif station_type == CLEAN_TYPE:
             if not clean_template:
                 raise ValueError("生成密闭式清洁站日报需要上传密闭式清洁站模板")
-            output = output_dir / f"{result.report_date_code}_密闭式清洁站检查情况.docx"
+            output = output_dir / f"{result.report_date_text}密闭式清洁站检查情况.docx"
             render_one(result, station_type, clean_template, output)
         else:
             raise ValueError(f"不支持的日报类型：{station_type}")
@@ -218,9 +223,13 @@ def build_transfer_station_detail_items(items: list[SimpleNamespace], show_empty
 
 
 def make_zip(files: list[Path], output_root: Path, report_date: date) -> Path:
-    zip_path = output_root / report_date.strftime("%Y%m%d") / f"{report_date.strftime('%Y%m%d')}_日报.zip"
+    zip_path = output_root / f"{report_date.strftime('%Y%m%d')}_日报.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file in files:
-            archive.write(file, arcname=file.name)
+            try:
+                arcname = file.relative_to(output_root)
+            except ValueError:
+                arcname = file.name
+            archive.write(file, arcname=arcname.as_posix() if isinstance(arcname, Path) else arcname)
     return zip_path

@@ -51,9 +51,14 @@ from scripts.monthly_generator import (  # noqa: E402
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RAW_INPUT_DIR,
     DEFAULT_TEMPLATE_DIR,
-    generate_monthly_report,
+    generate_monthly_reports,
     normalize_station_type,
 )
+
+
+def find_default_month_template(keyword: str) -> str:
+    matches = sorted(DEFAULT_TEMPLATE_DIR.glob(f"*{keyword}*.docx"))
+    return str(matches[0]) if matches else ""
 
 
 class TextWriter:
@@ -99,9 +104,11 @@ class ReportToolApp:
 
         self.month_year_var = StringVar(value="2026")
         self.month_month_var = StringVar(value="5")
-        self.month_type_var = StringVar(value="1 - 密闭式清洁站")
+        self.month_clean_var = BooleanVar(value=True)
+        self.month_transfer_var = BooleanVar(value=True)
         self.month_raw_dir_var = StringVar(value=str(DEFAULT_RAW_INPUT_DIR))
-        self.month_template_path_var = StringVar(value="")
+        self.month_clean_template_path_var = StringVar(value=find_default_month_template("密闭式清洁站"))
+        self.month_transfer_template_path_var = StringVar(value=find_default_month_template("中转站"))
         self.month_output_dir_var = StringVar(value=str(DEFAULT_OUTPUT_DIR))
 
     def ensure_default_dirs(self) -> None:
@@ -112,7 +119,8 @@ class ReportToolApp:
             DEFAULT_CONVERTED_DIR / "中转站",
             DEFAULT_TEMPLATE_DIR,
             DEFAULT_OUTPUT_DIR,
-            DAILY_OUTPUT_ROOT,
+            DAILY_OUTPUT_ROOT / "清洁站",
+            DAILY_OUTPUT_ROOT / "中转站",
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -209,17 +217,12 @@ class ReportToolApp:
         type_box = Frame(row1)
         type_box.pack(side=LEFT, padx=(18, 0))
         Label(type_box, text="报告类型").pack(anchor="w")
-        type_select = ttk.Combobox(
-            type_box,
-            textvariable=self.month_type_var,
-            values=("1 - 密闭式清洁站", "2 - 中转站"),
-            width=20,
-            state="readonly",
-        )
-        type_select.pack()
+        ttk.Checkbutton(type_box, text="密闭式清洁站", variable=self.month_clean_var).pack(side=LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_box, text="中转站", variable=self.month_transfer_var).pack(side=LEFT)
 
         self.add_folder_row(form, "日报所在文件夹", self.month_raw_dir_var, self.choose_month_raw_dir, width=16)
-        self.add_file_row(form, "月报docx模板", self.month_template_path_var, self.choose_month_template_file, width=16)
+        self.add_file_row(form, "清洁站月报模板", self.month_clean_template_path_var, self.choose_month_clean_template_file, width=16)
+        self.add_file_row(form, "中转站月报模板", self.month_transfer_template_path_var, self.choose_month_transfer_template_file, width=16)
         self.add_folder_row(form, "月报输出文件夹", self.month_output_dir_var, self.choose_month_output_dir, width=16)
 
         actions = Frame(parent)
@@ -272,8 +275,11 @@ class ReportToolApp:
     def choose_month_output_dir(self) -> None:
         self.choose_folder("选择月报输出文件夹", self.month_output_dir_var)
 
-    def choose_month_template_file(self) -> None:
-        self.choose_docx_file("选择月报docx模板", self.month_template_path_var, DEFAULT_TEMPLATE_DIR)
+    def choose_month_clean_template_file(self) -> None:
+        self.choose_docx_file("选择清洁站月报docx模板", self.month_clean_template_path_var, DEFAULT_TEMPLATE_DIR)
+
+    def choose_month_transfer_template_file(self) -> None:
+        self.choose_docx_file("选择中转站月报docx模板", self.month_transfer_template_path_var, DEFAULT_TEMPLATE_DIR)
 
     def choose_docx_file(self, title: str, variable: StringVar, initial_dir: Path) -> None:
         selected = filedialog.askopenfilename(
@@ -486,54 +492,74 @@ class ReportToolApp:
             return
         year = self.month_year_var.get().strip()
         month = self.month_month_var.get().strip()
-        station_type = "2" if self.month_type_var.get().startswith("2") else "1"
+        station_types = self.selected_monthly_types()
+        if not station_types:
+            messagebox.showerror("参数错误", "请至少选择一种月报类型。")
+            return
         if not year.isdigit() or not month.isdigit():
             messagebox.showerror("参数错误", "年份和月份必须是数字。")
             return
         raw_dir = Path(self.month_raw_dir_var.get().strip())
-        template_text = self.month_template_path_var.get().strip()
-        template_path = Path(template_text) if template_text else None
+        template_paths = self.selected_monthly_template_paths()
         output_dir = Path(self.month_output_dir_var.get().strip())
         if not raw_dir.exists():
             messagebox.showerror("路径错误", "日报所在文件夹不存在。")
             return
-        if template_path and not template_path.exists():
-            messagebox.showerror("路径错误", "月报docx模板不存在。")
-            return
+        for station_type, template_path in template_paths.items():
+            if template_path and not template_path.exists():
+                messagebox.showerror("路径错误", f"{station_type}月报docx模板不存在。")
+                return
 
         self.status_var.set("生成月报中")
         self.generate_monthly_button.config(state="disabled")
         self.write_log("\n========== 开始生成月报 ==========\n")
-        args = (int(year), month, station_type, raw_dir, output_dir, template_path)
+        args = (int(year), month, station_types, raw_dir, output_dir, template_paths)
         self.worker = threading.Thread(target=self.run_monthly_generation, args=args, daemon=True)
         self.worker.start()
+
+    def selected_monthly_types(self) -> list[str]:
+        types: list[str] = []
+        if self.month_clean_var.get():
+            types.append("清洁站")
+        if self.month_transfer_var.get():
+            types.append("中转站")
+        return types
+
+    def selected_monthly_template_paths(self) -> dict[str, Path | None]:
+        clean_template = self.month_clean_template_path_var.get().strip()
+        transfer_template = self.month_transfer_template_path_var.get().strip()
+        return {
+            "清洁站": Path(clean_template) if clean_template else None,
+            "中转站": Path(transfer_template) if transfer_template else None,
+        }
 
     def run_monthly_generation(
         self,
         year: int,
         month: str,
-        station_type: str,
+        station_types: list[str],
         raw_dir: Path,
         output_dir: Path,
-        template_path: Path | None,
+        template_paths: dict[str, Path | None],
     ) -> None:
         original_stdout = sys.stdout
         sys.stdout = TextWriter(self.messages)
         try:
-            output_path = generate_monthly_report(
+            output_paths = generate_monthly_reports(
                 raw_input_dir=raw_dir,
                 converted_dir=DEFAULT_CONVERTED_DIR,
                 output_dir=output_dir,
                 month=month,
                 year=year,
-                station_type=normalize_station_type(station_type),
+                station_types=[normalize_station_type(value) for value in station_types],
                 engine="auto",
                 skip_convert=False,
-                template_path=template_path,
+                template_paths=template_paths,
             )
-            self.messages.put(f"\n[完成] 月报已生成：{output_path}\n")
+            output_text = "\n".join(str(path) for path in output_paths)
+            self.messages.put(f"\n[完成] 月报已生成：\n{output_text}\n")
             self.root.after(0, lambda: self.status_var.set("月报生成完成"))
-            self.root.after(0, lambda: messagebox.showinfo("生成完成", f"月报已生成：\n{output_path}"))
+            self.root.after(0, lambda: messagebox.showinfo("生成完成", f"月报已生成：\n{output_text}"))
         except Exception:
             self.messages.put("\n[失败]\n")
             self.messages.put(traceback.format_exc())

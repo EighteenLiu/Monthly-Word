@@ -364,12 +364,32 @@ def normalize_issue_text(text: str) -> str:
     return text if text.endswith(("。", "！", "？")) else f"{text}。"
 
 
+def strip_heading_number_prefix(text: str) -> str:
+    text = (text or "").strip()
+    number_pattern = re.compile(
+        r"^\s*(?:"
+        r"[（(][一二三四五六七八九十百千万零〇\d]+[）)]"
+        r"|[一二三四五六七八九十百千万零〇\d]+[、.．]"
+        r")\s*"
+    )
+    while True:
+        stripped = number_pattern.sub("", text, count=1).strip()
+        if stripped == text:
+            return stripped
+        text = stripped
+
+
+def normalize_street_name(value: str) -> str:
+    return strip_heading_number_prefix(value).strip()
+
+
 def split_street_station(title: str) -> tuple[str, str]:
+    title = strip_heading_number_prefix(title)
     marker = "街道"
     idx = title.find(marker)
     if idx == -1:
         return "未识别街道", title.strip()
-    street = title[: idx + len(marker)].strip()
+    street = normalize_street_name(title[: idx + len(marker)])
     station = title[idx + len(marker) :].strip()
     return street, station or title.strip()
 
@@ -405,17 +425,24 @@ def normalize_station_type(station_type: str) -> str:
 
 
 def infer_station_type_from_path(path: Path) -> str | None:
-    filename = path.name
-    if "密闭式清洁站" in filename or "清洁站" in filename:
-        return "清洁站"
-    if "中转站" in filename or "可回收物中转站" in filename:
-        return "中转站"
+    filename_type = infer_station_type_from_filename(path)
+    if filename_type:
+        return filename_type
     for part in reversed(path.parts[:-1]):
         if part in {"清洁站", "密闭式清洁站"}:
             return "清洁站"
         if part in {"中转站", "可回收物中转站"}:
             return "中转站"
     return None
+
+
+def infer_station_type_from_filename(path: Path) -> str | None:
+    filename = path.name
+    is_clean = "密闭式清洁站" in filename or "清洁站" in filename
+    is_transfer = "可回收物中转站" in filename or "中转站" in filename
+    if is_clean == is_transfer:
+        return None
+    return "清洁站" if is_clean else "中转站"
 
 
 def path_matches_station_type(path: Path, station_type: str) -> bool:
@@ -614,6 +641,7 @@ def collect_records(source_dirs: Path | list[Path], station_type: str, year: int
     records: list[DailyRecord] = []
     seen: set[Path] = set()
     paths: list[Path] = []
+    skipped_other_type = 0
     for source_dir in source_dirs:
         for path in iter_docx_files(source_dir):
             resolved = path.resolve()
@@ -622,7 +650,11 @@ def collect_records(source_dirs: Path | list[Path], station_type: str, year: int
             seen.add(resolved)
             paths.append(path)
     for path in sorted(paths):
-        if not path_matches_station_type(path, station_type):
+        filename_type = infer_station_type_from_filename(path)
+        if filename_type and filename_type != station_type:
+            skipped_other_type += 1
+            continue
+        if filename_type is None and not path_matches_station_type(path, station_type):
             continue
         parsed_date = daily_date_from_name(path)
         if parsed_date is None:
@@ -631,6 +663,8 @@ def collect_records(source_dirs: Path | list[Path], station_type: str, year: int
         if not start <= record_date <= end:
             continue
         records.extend(parse_daily_report(path, categories))
+    if skipped_other_type:
+        print(f"[跳过] {skipped_other_type} 个文件名类型与当前月报类型不一致的日报")
     return sorted(
         records,
         key=lambda item: (record_date_for_period(item.month, item.day, start, end), item.street, item.station),
@@ -948,6 +982,7 @@ def get_or_create_paragraph_style(document: Document, names: tuple[str, ...], fa
 
 def set_style_outline_level(style, level: int) -> None:
     p_pr = style._element.get_or_add_pPr()
+    remove_numbering_from_ppr(p_pr)
     outline = p_pr.find(qn("w:outlineLvl"))
     if outline is None:
         outline = OxmlElement("w:outlineLvl")
@@ -967,6 +1002,17 @@ def get_heading_style_name(document: Document, level: int) -> str | None:
     return style.name if style else None
 
 
+def remove_numbering_from_ppr(p_pr) -> None:
+    num_pr = p_pr.find(qn("w:numPr"))
+    if num_pr is not None:
+        p_pr.remove(num_pr)
+
+
+def remove_paragraph_numbering(paragraph) -> None:
+    p_pr = paragraph._p.get_or_add_pPr()
+    remove_numbering_from_ppr(p_pr)
+
+
 def add_paragraph(document: Document, text: str, *, bold: bool = False, align=None) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.first_line_indent = None if bold else Cm(0.74)
@@ -983,6 +1029,7 @@ def add_paragraph(document: Document, text: str, *, bold: bool = False, align=No
 
 def add_station_paragraph(document: Document, label: str, issue_text: str, has_problem: bool) -> None:
     paragraph = document.add_paragraph(style=get_heading_style_name(document, 3))
+    remove_paragraph_numbering(paragraph)
     paragraph.paragraph_format.first_line_indent = Cm(0.74)
     paragraph.paragraph_format.line_spacing = 1.5
     paragraph.paragraph_format.space_after = Pt(0)
@@ -1021,6 +1068,7 @@ def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None
 
 def add_heading(document: Document, text: str, level: int) -> None:
     paragraph = document.add_paragraph(style=get_heading_style_name(document, level))
+    remove_paragraph_numbering(paragraph)
     paragraph.paragraph_format.first_line_indent = None
     paragraph.paragraph_format.line_spacing = 1.5
     paragraph.paragraph_format.space_before = Pt(6 if level == 1 else 3)
@@ -1203,9 +1251,10 @@ def summarize_records(
     counts: dict[str, dict[str, int]] = defaultdict(lambda: {category: 0 for category, _ in categories})
 
     for record in records:
-        by_street[record.street].append(record)
+        street = normalize_street_name(record.street)
+        by_street[street].append(record)
         for category, count in record.issue_counts.items():
-            counts[record.street][category] += count
+            counts[street][category] += count
 
     return dict(sorted(by_street.items())), dict(sorted(counts.items()))
 
@@ -1307,8 +1356,22 @@ def create_monthly_docx(
 
     cleanup_empty_paragraphs(document)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    document.save(output_path)
-    return output_path
+    try:
+        document.save(output_path)
+        return output_path
+    except PermissionError:
+        fallback_path = next_available_output_path(output_path)
+        document.save(fallback_path)
+        print(f"[提示] 输出文件可能已被打开或占用，已另存为：{fallback_path}")
+        return fallback_path
+
+
+def next_available_output_path(path: Path) -> Path:
+    for index in range(1, 100):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise PermissionError(f"输出文件被占用，且无法生成可用的新文件名：{path}")
 
 
 def generate_monthly_report(
@@ -1343,6 +1406,48 @@ def generate_monthly_report(
     return create_monthly_docx(records, output_path, report_year, report_month, station_type, template_path)
 
 
+def generate_monthly_reports(
+    raw_input_dir: Path = DEFAULT_RAW_INPUT_DIR,
+    converted_dir: Path = DEFAULT_CONVERTED_DIR,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    month: str | int | None = None,
+    year: int | None = None,
+    station_types: list[str] | tuple[str, ...] | None = None,
+    engine: str = "auto",
+    skip_convert: bool = False,
+    template_paths: dict[str, Path | None] | None = None,
+) -> list[Path]:
+    selected_types = [normalize_station_type(value) for value in (station_types or [DEFAULT_STATION_TYPE])]
+    selected_types = list(dict.fromkeys(selected_types))
+    generated: list[Path] = []
+    failures: list[str] = []
+
+    for station_type in selected_types:
+        template_path = (template_paths or {}).get(station_type)
+        try:
+            generated.append(
+                generate_monthly_report(
+                    raw_input_dir=raw_input_dir,
+                    converted_dir=converted_dir,
+                    output_dir=output_dir,
+                    month=month,
+                    year=year,
+                    station_type=station_type,
+                    engine=engine,
+                    skip_convert=skip_convert,
+                    template_path=template_path,
+                )
+            )
+        except ValueError as exc:
+            failures.append(f"{station_type}: {exc}")
+
+    if not generated:
+        raise ValueError("未生成任何月报。" + ("\n" + "\n".join(failures) if failures else ""))
+    if failures:
+        print("[跳过]\n" + "\n".join(failures))
+    return generated
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="汇总日报并生成密闭式清洁站月度检查通报")
     parser.add_argument("--raw-input", type=Path, default=DEFAULT_RAW_INPUT_DIR, help="原始 .doc 日报根目录")
@@ -1350,7 +1455,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR, help="月报输出目录")
     parser.add_argument("--month", required=True, help="月份，例如 4、04 或 2026-04")
     parser.add_argument("--year", type=int, help="报告年份，默认从 --month 解析，解析不到则为 2026")
-    parser.add_argument("--station-type", default=DEFAULT_STATION_TYPE, help="日报子目录名称，默认：清洁站")
+    parser.add_argument("--station-type", nargs="+", default=[DEFAULT_STATION_TYPE], help="日报类型，可同时指定：清洁站 中转站")
     parser.add_argument("--template", type=Path, help="月报 docx 模板文件，可选")
     parser.add_argument(
         "--engine",
@@ -1365,16 +1470,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        output_path = generate_monthly_report(
+        output_paths = generate_monthly_reports(
             raw_input_dir=args.raw_input,
             converted_dir=args.converted_output,
             output_dir=args.output,
             month=args.month,
             year=args.year,
-            station_type=args.station_type,
+            station_types=args.station_type,
             engine=args.engine,
             skip_convert=args.skip_convert,
-            template_path=args.template,
+            template_paths={normalize_station_type(value): args.template for value in args.station_type} if args.template else None,
         )
     except PermissionError as exc:
         print(f"[失败] 无法写入目标文件，可能正在被 Word 打开：{exc.filename}", file=sys.stderr)
@@ -1384,7 +1489,9 @@ def main() -> int:
         print(f"[失败] {exc}", file=sys.stderr)
         return 1
 
-    print(f"[完成] 月报已生成：{output_path}")
+    print("[完成] 月报已生成：")
+    for output_path in output_paths:
+        print(output_path)
     return 0
 
 

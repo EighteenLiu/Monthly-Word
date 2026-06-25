@@ -18,7 +18,7 @@ from monthly_generator import (
     DEFAULT_RAW_INPUT_DIR,
     DEFAULT_STATION_TYPE,
     ConversionError,
-    generate_monthly_report,
+    generate_monthly_reports,
 )
 
 
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--monthly-output", type=Path, default=DEFAULT_OUTPUT_DIR, help="月报输出目录")
     parser.add_argument("--month", required=True, help="月份，例如 4、04 或 2026-04")
     parser.add_argument("--year", type=int, help="报告年份，默认从 --month 解析，解析不到则为 2026")
-    parser.add_argument("--station-type", default=DEFAULT_STATION_TYPE, help="日报子目录名称，默认：清洁站")
+    parser.add_argument("--station-type", nargs="+", default=[DEFAULT_STATION_TYPE], help="日报类型，可同时指定：清洁站 中转站")
     parser.add_argument(
         "--engine",
         choices=("auto", "word", "libreoffice"),
@@ -43,13 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        output_path = generate_monthly_report(
+        output_paths = generate_monthly_reports(
             raw_input_dir=args.raw_input,
             converted_dir=args.converted_output,
             output_dir=args.monthly_output,
             month=args.month,
             year=args.year,
-            station_type=args.station_type,
+            station_types=args.station_type,
             engine=args.engine,
             skip_convert=args.skip_convert,
         )
@@ -57,7 +57,9 @@ def main() -> int:
         print(f"[失败] {exc}", file=sys.stderr)
         return 1
 
-    print(f"[完成] 月报已生成：{output_path}")
+    print("[完成] 月报已生成：")
+    for output_path in output_paths:
+        print(output_path)
     return 0
 
 
