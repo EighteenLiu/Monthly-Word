@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
@@ -24,7 +25,7 @@ from pathlib import Path
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -46,6 +47,7 @@ DEFAULT_TEMPLATE_DIR = PROJECT_ROOT / "03_月报模板"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "04_输出月报"
 DEFAULT_STATION_TYPE = "清洁站"
 DEFAULT_YEAR = 2026
+TEMP_WORK_ROOT_NAME = "_monthly_work"
 A4_WIDTH = Cm(21)
 A4_HEIGHT = Cm(29.7)
 
@@ -56,7 +58,7 @@ CLEANING_ISSUE_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
     ("无称重系统或称重系统损坏", ("无称重系统", "称重系统损坏", "无称重", "称重设备损坏", "称重屏幕破损")),
     ("小型收集车混装混运", ("小型收集车混装混运", "混装混运")),
     ("箱体内垃圾混投", ("箱体内垃圾混投", "垃圾混投", "混投")),
-    ("未开门运行", ("未开门运行", "未开门")),
+    ("未开门运行", ("未开门运行", "未开门", "不运行", "未运行")),
     ("拒收单不准确", ("拒收单不准确", "拒收单")),
 ]
 
@@ -77,7 +79,7 @@ TRANSFER_ISSUE_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
     ("配电箱处堆放杂物", ("配电箱处堆放杂物", "配电箱堆放杂物")),
     ("安全员未按时上岗", ("安全员未按时上岗",)),
     ("安全员无明显身份标识", ("安全员无明显身份标识", "全员无明显身份标识", "无明显身份标识")),
-    ("未按时开门运行", ("未按时开门运行", "未开门运行", "未开门")),
+    ("未按时开门运行", ("未按时开门运行", "未开门运行", "未开门", "不运行", "未运行")),
     ("无企安安", ("无企安安", "企安安无法正常登录")),
     ("无灭蝇措施", ("无灭蝇措施",)),
 ]
@@ -91,7 +93,7 @@ STATION_PROFILES = {
         "detail_heading": "二、各街道情况",
         "categories": CLEANING_ISSUE_CATEGORIES,
         "unopened_category": "未开门运行",
-        "non_problem_status_keywords": (),
+        "non_problem_status_keywords": ("已关闭", "已关门", "已停业", "停业", "闭店", "歇业", "暂停营业"),
     },
     "中转站": {
         "title": "西城区可回收物中转站检查情况通报",
@@ -154,6 +156,7 @@ class MergedRecord:
 class ConversionSummary:
     converted: int = 0
     skipped: int = 0
+    skipped_out_of_period: int = 0
     failed: list[tuple[Path, str]] = field(default_factory=list)
 
 
@@ -266,14 +269,26 @@ def ensure_converted(
     converted_dir: Path,
     station_type: str = DEFAULT_STATION_TYPE,
     engine: str = "auto",
+    year: int | None = None,
+    month: int | None = None,
 ) -> ConversionSummary:
     station_type = normalize_station_type(station_type)
     target_root = converted_dir / station_type
     summary = ConversionSummary()
+    period: tuple[date, date] | None = report_period(year, month) if year is not None and month is not None else None
 
     for source in iter_doc_files(raw_input_dir):
         if not path_matches_station_type(source, station_type):
             continue
+        if period is not None:
+            parsed_date = daily_date_from_name(source)
+            if parsed_date is None:
+                summary.skipped_out_of_period += 1
+                continue
+            record_date = record_date_for_period(parsed_date[0], parsed_date[1], period[0], period[1])
+            if not period[0] <= record_date <= period[1]:
+                summary.skipped_out_of_period += 1
+                continue
         relative = source.relative_to(raw_input_dir)
         target = (target_root / relative).with_suffix(".docx")
         try:
@@ -290,15 +305,40 @@ def ensure_converted(
 
     if summary.skipped:
         print(f"[跳过] {summary.skipped} 个日报已完成 doc -> docx 转换")
+    if summary.skipped_out_of_period:
+        print(f"[跳过] {summary.skipped_out_of_period} 个日报不在本次报告期内，未转换")
     if summary.converted:
         print(f"[完成] 本次新转换 {summary.converted} 个日报")
-    if not summary.converted and not summary.skipped:
+    if not summary.converted and not summary.skipped and not summary.skipped_out_of_period:
         matching_docx = [path for path in iter_docx_files(raw_input_dir) if path_matches_station_type(path, station_type)]
         if matching_docx:
             print(f"[提示] 未发现原始 .doc 日报，将直接汇总 {len(matching_docx)} 个已生成 .docx 日报")
         else:
             print(f"[提示] 未发现 {station_type} 原始 .doc 或已生成 .docx 日报：{raw_input_dir}")
     return summary
+
+
+def is_on_c_drive(path: Path) -> bool:
+    drive = path.resolve().drive
+    return drive.lower() == "c:"
+
+
+def create_monthly_work_dir(*candidate_roots: Path) -> Path:
+    for root in candidate_roots:
+        if not root:
+            continue
+        resolved_root = root.resolve()
+        if is_on_c_drive(resolved_root):
+            continue
+        work_dir = resolved_root / TEMP_WORK_ROOT_NAME / uuid.uuid4().hex
+        work_dir.mkdir(parents=True, exist_ok=False)
+        return work_dir
+    raise RuntimeError("无法创建临时目录：候选路径都位于 C 盘，请选择非 C 盘输出目录。")
+
+
+def cleanup_work_dir(work_dir: Path | None) -> None:
+    if work_dir is not None:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def parse_month(value: str | int | None) -> int:
@@ -359,6 +399,7 @@ def daily_date_from_name(path: Path) -> tuple[int, int] | None:
 
 def normalize_issue_text(text: str) -> str:
     text = re.sub(r"\s+", "", text or "")
+    text = re.sub(r"^存在的问题是[:：]?", "", text)
     if not text or text in {"无问题", "未发现问题"}:
         return "无问题。"
     return text if text.endswith(("。", "！", "？")) else f"{text}。"
@@ -380,7 +421,11 @@ def strip_heading_number_prefix(text: str) -> str:
 
 
 def normalize_street_name(value: str) -> str:
-    return strip_heading_number_prefix(value).strip()
+    value = strip_heading_number_prefix(value).strip()
+    # 广外 = 广安门外，广内 = 广安门内，统一用简称避免同一街道出现重复标题
+    value = value.replace("广安门外", "广外")
+    value = value.replace("广安门内", "广内")
+    return value
 
 
 def split_street_station(title: str) -> tuple[str, str]:
@@ -454,10 +499,43 @@ def count_issue_categories(issue_text: str, categories: list[tuple[str, tuple[st
     counts = {category: 0 for category, _ in categories}
     if normalized == "无问题。":
         return counts
-    for category, keywords in categories:
-        if any(keyword in normalized for keyword in keywords):
+    for item in split_issue_items(normalized):
+        category = best_issue_category(item, categories)
+        if category:
             counts[category] = 1
     return counts
+
+
+def best_issue_category(item: str, categories: list[tuple[str, tuple[str, ...]]]) -> str | None:
+    normalized_item = normalize_issue_match_text(item)
+    best_category: str | None = None
+    best_length = -1
+    for category, keywords in categories:
+        for keyword in (category, *keywords):
+            for candidate in issue_match_candidates(keyword):
+                if candidate in normalized_item and len(candidate) > best_length:
+                    best_category = category
+                    best_length = len(candidate)
+    return best_category
+
+
+def normalize_issue_match_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").replace("台帐", "台账").replace("帐", "账")
+
+
+def issue_match_candidates(text: str) -> tuple[str, ...]:
+    normalized = normalize_issue_match_text(text).strip("，,。；;：:")
+    if not normalized:
+        return ()
+
+    candidates = {normalized}
+    if normalized.startswith("无") and len(normalized) > 1:
+        candidates.add(normalized[1:])
+    for candidate in tuple(candidates):
+        if "精细化" in candidate:
+            candidates.add(candidate.replace("精细化", "细化"))
+
+    return tuple(sorted(candidates, key=len, reverse=True))
 
 
 def previous_nonempty_paragraph_text(paragraphs, index: int) -> str:
@@ -680,15 +758,48 @@ def set_cell_shading(cell, fill: str) -> None:
     shading.set(qn("w:fill"), fill)
 
 
+def set_table_borders(table) -> None:
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(borders)
+    for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        border = borders.find(qn(f"w:{border_name}"))
+        if border is None:
+            border = OxmlElement(f"w:{border_name}")
+            borders.append(border)
+        border.set(qn("w:val"), "single")
+        border.set(qn("w:sz"), "4")
+        border.set(qn("w:space"), "0")
+        border.set(qn("w:color"), "000000")
+
+
+def set_repeat_table_header(row) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    tbl_header = tr_pr.find(qn("w:tblHeader"))
+    if tbl_header is None:
+        tbl_header = OxmlElement("w:tblHeader")
+        tr_pr.append(tbl_header)
+    tbl_header.set(qn("w:val"), "true")
+
+
+def set_table_row_min_height(row, height_cm: float = 0.8) -> None:
+    row.height = Cm(height_cm)
+    row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+
+
 def set_cell_text(cell, text: str, bold: bool = False) -> None:
     cell.text = ""
     paragraph = cell.paragraphs[0]
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0)
     run = paragraph.add_run(text)
     run.bold = bold
-    run.font.name = "仿宋"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-    run.font.size = Pt(10.5)
+    run.font.name = "仿宋_GB2312"
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
+    run.font.size = Pt(10)
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
 
@@ -817,12 +928,18 @@ def default_jinja_template_content(profile: dict) -> str:
     return "\n".join(lines)
 
 
-def export_jinja_text_template(template_path: Path | None, station_type: str, profile: dict) -> Path | None:
+def export_jinja_text_template(
+    template_path: Path | None,
+    station_type: str,
+    profile: dict,
+    work_dir: Path | None = None,
+) -> Path | None:
     if not template_path:
         return None
-    DEFAULT_TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    target_dir = work_dir or create_monthly_work_dir(DEFAULT_OUTPUT_DIR, PROJECT_ROOT)
+    target_dir.mkdir(parents=True, exist_ok=True)
     station_name = normalize_station_type(station_type)
-    target = DEFAULT_TEMPLATE_DIR / f"{station_name}_auto_template.jinja2"
+    target = target_dir / f"{station_name}_auto_template.jinja2"
     parsed_lines = read_docx_template_lines(template_path, profile)
     content = "\n".join(parsed_lines) if parsed_lines else default_jinja_template_content(profile)
     target.write_text(content, encoding="utf-8")
@@ -847,7 +964,7 @@ def build_template_context(
         use_station_numbers = len(street_records) > 1
         stations: list[dict] = []
         for station_index, record in enumerate(street_records, start=1):
-            issue_text, has_problem = format_station_issue_text(record)
+            issue_text, has_problem = format_station_issue_text(record, profile)
             station_label = format_station_label(record, station_index, use_station_numbers, station_type)
             image_key = f"s{street_index}_p{station_index}"
             station_key = image_key
@@ -1098,22 +1215,31 @@ def is_unopened_record(record: DailyRecord, profile: dict) -> bool:
     return record.issue_counts.get(category, 0) > 0 and sum(record.issue_counts.values()) == 1
 
 
+def record_status_text(record: DailyRecord) -> str:
+    return normalize_issue_text(record.issue_text)
+
+
+def is_closed_status_record(record: DailyRecord, profile: dict) -> bool:
+    status_text = record_status_text(record)
+    return any(keyword in status_text for keyword in profile.get("non_problem_status_keywords", ()))
+
+
 def is_body_record(record: DailyRecord, profile: dict) -> bool:
     if not record.has_problem or is_unopened_record(record, profile):
         return False
-    if sum(record.issue_counts.values()) == 0 and any(
-        keyword in record.issue_text for keyword in profile.get("non_problem_status_keywords", ())
-    ):
+    if sum(record.issue_counts.values()) == 0 and is_closed_status_record(record, profile):
         return False
     return True
 
 
-def record_has_report_problem(record: DailyRecord) -> bool:
+def record_has_report_problem(record: DailyRecord, profile: dict | None = None) -> bool:
+    if profile and is_closed_status_record(record, profile):
+        return False
     return sum(record.issue_counts.values()) > 0
 
 
-def format_station_issue_text(record: DailyRecord) -> tuple[str, bool]:
-    if record_has_report_problem(record):
+def format_station_issue_text(record: DailyRecord, profile: dict | None = None) -> tuple[str, bool]:
+    if record_has_report_problem(record, profile):
         return format_issue_items(split_issue_items(record.issue_text)), True
     return normalize_issue_text(record.issue_text), False
 
@@ -1134,7 +1260,13 @@ def build_body_records(
     categories: list[tuple[str, tuple[str, ...]]],
 ) -> list[DailyRecord]:
     if normalize_station_type(station_type) == "中转站":
-        return sorted(records, key=lambda record: (record.street, record.month, record.day, record.station))
+        # 同一站点同一天只保留一条记录，避免日报中不同前缀格式造成重复
+        seen: dict[tuple[str, str, int, int], DailyRecord] = {}
+        for record in sorted(records, key=lambda r: (r.street, r.month, r.day, r.station)):
+            key = (record.street, record.station, record.month, record.day)
+            if key not in seen:
+                seen[key] = record
+        return list(seen.values())
     return select_latest_station_records(records, categories)
 
 
@@ -1183,9 +1315,9 @@ def format_issue_items(items: list[str]) -> str:
 
 
 def issue_item_key(item: str, categories: list[tuple[str, tuple[str, ...]]]) -> str:
-    for category, keywords in categories:
-        if any(keyword in item for keyword in keywords):
-            return f"category:{category}"
+    category = best_issue_category(item, categories)
+    if category:
+        return f"category:{category}"
     return f"text:{item}"
 
 
@@ -1237,10 +1369,35 @@ def select_latest_station_records(
     records: list[DailyRecord],
     categories: list[tuple[str, tuple[str, ...]]],
 ) -> list[DailyRecord]:
-    latest: dict[tuple[str, str], DailyRecord] = {}
+    profile = get_station_profile("清洁站")
+    latest_by_station: dict[tuple[str, str], list[DailyRecord]] = defaultdict(list)
     for record in records:
-        latest[(record.street, record.station)] = record
-    return sorted(latest.values(), key=lambda record: (record.street, record.station))
+        latest_by_station[(record.street, record.station)].append(record)
+
+    selected: list[DailyRecord] = []
+    for station_key, station_records in latest_by_station.items():
+        station_records = sorted(station_records, key=lambda record: (record.month, record.day))
+        latest_month = station_records[-1].month
+        latest_day = station_records[-1].day
+        latest_records = [
+            record for record in station_records if record.month == latest_month and record.day == latest_day
+        ]
+
+        closed_record = next((record for record in reversed(latest_records) if is_closed_status_record(record, profile)), None)
+        if closed_record is not None:
+            continue
+
+        problem_record = next(
+            (record for record in reversed(latest_records) if record_has_report_problem(record, profile)),
+            None,
+        )
+        if problem_record is not None:
+            selected.append(problem_record)
+            continue
+
+        selected.append(latest_records[-1])
+
+    return sorted(selected, key=lambda record: (record.street, record.station))
 
 
 def summarize_records(
@@ -1267,7 +1424,7 @@ def build_summary_sentence(
     street_count: int,
 ) -> str:
     start, end = report_period(year, month)
-    problem_records = [record for record in records if record_has_report_problem(record)]
+    problem_records = [record for record in records if record_has_report_problem(record, profile)]
     start_label = format_date_cn(start)
     end_label = format_date_cn(end)
 
@@ -1287,6 +1444,9 @@ def add_issue_table(document: Document, counts: dict[str, dict[str, int]], categ
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.style = "Table Grid"
     table.autofit = True
+    set_table_borders(table)
+    set_repeat_table_header(table.rows[0])
+    set_table_row_min_height(table.rows[0])
 
     for index, header in enumerate(headers):
         cell = table.rows[0].cells[index]
@@ -1301,6 +1461,7 @@ def add_issue_table(document: Document, counts: dict[str, dict[str, int]], categ
     rows = [("总计", total_by_category), *counts.items()]
     for street, street_counts in rows:
         row = table.add_row()
+        set_table_row_min_height(row)
         values = [street]
         problem_total = 0
         for category, _ in categories:
@@ -1319,51 +1480,60 @@ def create_monthly_docx(
     month: int,
     station_type: str,
     template_path: Path | None = None,
+    work_dir: Path | None = None,
 ) -> Path:
     profile = get_station_profile(station_type)
     categories = profile["categories"]
     if not records:
         raise ValueError(f"未找到 {month} 月{profile['subject']}日报记录")
 
-    document = create_document_from_template(template_path)
-    jinja_path = export_jinja_text_template(template_path, station_type, profile)
-    if jinja_path:
-        print(f"[模板] 已自动生成 Jinja2 文本模板：{jinja_path}")
-    configure_styles(document)
+    own_work_dir = work_dir is None
+    if own_work_dir:
+        work_dir = create_monthly_work_dir(output_path.parent, PROJECT_ROOT)
 
-    configure_portrait_a4_section(document.sections[0])
-
-    context, image_map, counts = build_template_context(records, year, month, station_type, profile, categories)
-    render_jinja_body(document, jinja_path, context, image_map)
-
-    landscape = document.add_section(WD_ORIENT.LANDSCAPE)
-    configure_landscape_a4_section(landscape)
-
-    start, end = report_period(year, month)
-    attachment = document.add_paragraph()
-    attachment.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    attachment.paragraph_format.space_before = Pt(8)
-    attachment.paragraph_format.space_after = Pt(8)
-    run = attachment.add_run(
-        f"附件：{format_date_cn(start)}至{format_date_cn(end)}"
-        f"{profile['attachment_subject']}各项指标问题数"
-    )
-    run.font.name = "仿宋"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-    run.font.size = Pt(14)
-
-    add_issue_table(document, counts, categories)
-
-    cleanup_empty_paragraphs(document)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        document.save(output_path)
-        return output_path
-    except PermissionError:
-        fallback_path = next_available_output_path(output_path)
-        document.save(fallback_path)
-        print(f"[提示] 输出文件可能已被打开或占用，已另存为：{fallback_path}")
-        return fallback_path
+        document = create_document_from_template(template_path)
+        jinja_path = export_jinja_text_template(template_path, station_type, profile, work_dir)
+        if jinja_path:
+            print(f"[临时] 已生成 Jinja2 文本模板：{jinja_path}")
+        configure_styles(document)
+
+        configure_portrait_a4_section(document.sections[0])
+
+        context, image_map, counts = build_template_context(records, year, month, station_type, profile, categories)
+        render_jinja_body(document, jinja_path, context, image_map)
+
+        landscape = document.add_section(WD_ORIENT.LANDSCAPE)
+        configure_landscape_a4_section(landscape)
+
+        start, end = report_period(year, month)
+        attachment = document.add_paragraph()
+        attachment.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        attachment.paragraph_format.space_before = Pt(8)
+        attachment.paragraph_format.space_after = Pt(8)
+        run = attachment.add_run(
+            f"附件：{format_date_cn(start)}至{format_date_cn(end)}"
+            f"{profile['attachment_subject']}各项指标问题数"
+        )
+        run.font.name = "仿宋"
+        run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+        run.font.size = Pt(14)
+
+        add_issue_table(document, counts, categories)
+
+        cleanup_empty_paragraphs(document)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            document.save(output_path)
+            return output_path
+        except PermissionError:
+            fallback_path = next_available_output_path(output_path)
+            document.save(fallback_path)
+            print(f"[提示] 输出文件可能已被打开或占用，已另存为：{fallback_path}")
+            return fallback_path
+    finally:
+        if own_work_dir:
+            cleanup_work_dir(work_dir)
 
 
 def next_available_output_path(path: Path) -> Path:
@@ -1384,26 +1554,34 @@ def generate_monthly_report(
     engine: str = "auto",
     skip_convert: bool = False,
     template_path: Path | None = None,
+    work_dir: Path | None = None,
 ) -> Path:
+    own_work_dir = work_dir is None
+    if own_work_dir:
+        work_dir = create_monthly_work_dir(output_dir, converted_dir, PROJECT_ROOT)
     station_type = normalize_station_type(station_type)
-    report_month = parse_month(month)
-    report_year = parse_year(year, month)
+    try:
+        report_month = parse_month(month)
+        report_year = parse_year(year, month)
 
-    matching_doc_sources = [path for path in iter_doc_files(raw_input_dir) if path_matches_station_type(path, station_type)]
+        matching_doc_sources = [path for path in iter_doc_files(raw_input_dir) if path_matches_station_type(path, station_type)]
 
-    if not skip_convert:
-        summary = ensure_converted(raw_input_dir, converted_dir, station_type, engine)
-        if summary.failed:
-            messages = "\n".join(f"{path}: {error}" for path, error in summary.failed)
-            raise ConversionError(f"部分日报转换失败：\n{messages}")
+        if not skip_convert:
+            summary = ensure_converted(raw_input_dir, converted_dir, station_type, engine, report_year, report_month)
+            if summary.failed:
+                messages = "\n".join(f"{path}: {error}" for path, error in summary.failed)
+                raise ConversionError(f"部分日报转换失败：\n{messages}")
 
-    record_sources = [raw_input_dir]
-    if matching_doc_sources:
-        record_sources.append(converted_dir / station_type)
-    records = collect_records(record_sources, station_type, report_year, report_month)
-    profile = get_station_profile(station_type)
-    output_path = output_dir / profile["output_name"].format(year=report_year, month=report_month)
-    return create_monthly_docx(records, output_path, report_year, report_month, station_type, template_path)
+        record_sources = [raw_input_dir]
+        if matching_doc_sources:
+            record_sources.append(converted_dir / station_type)
+        records = collect_records(record_sources, station_type, report_year, report_month)
+        profile = get_station_profile(station_type)
+        output_path = output_dir / profile["output_name"].format(year=report_year, month=report_month)
+        return create_monthly_docx(records, output_path, report_year, report_month, station_type, template_path, work_dir)
+    finally:
+        if own_work_dir:
+            cleanup_work_dir(work_dir)
 
 
 def generate_monthly_reports(
@@ -1421,31 +1599,36 @@ def generate_monthly_reports(
     selected_types = list(dict.fromkeys(selected_types))
     generated: list[Path] = []
     failures: list[str] = []
+    work_dir = create_monthly_work_dir(output_dir, converted_dir, PROJECT_ROOT)
 
-    for station_type in selected_types:
-        template_path = (template_paths or {}).get(station_type)
-        try:
-            generated.append(
-                generate_monthly_report(
-                    raw_input_dir=raw_input_dir,
-                    converted_dir=converted_dir,
-                    output_dir=output_dir,
-                    month=month,
-                    year=year,
-                    station_type=station_type,
-                    engine=engine,
-                    skip_convert=skip_convert,
-                    template_path=template_path,
+    try:
+        for station_type in selected_types:
+            template_path = (template_paths or {}).get(station_type)
+            try:
+                generated.append(
+                    generate_monthly_report(
+                        raw_input_dir=raw_input_dir,
+                        converted_dir=converted_dir,
+                        output_dir=output_dir,
+                        month=month,
+                        year=year,
+                        station_type=station_type,
+                        engine=engine,
+                        skip_convert=skip_convert,
+                        template_path=template_path,
+                        work_dir=work_dir,
+                    )
                 )
-            )
-        except ValueError as exc:
-            failures.append(f"{station_type}: {exc}")
+            except ValueError as exc:
+                failures.append(f"{station_type}: {exc}")
 
-    if not generated:
-        raise ValueError("未生成任何月报。" + ("\n" + "\n".join(failures) if failures else ""))
-    if failures:
-        print("[跳过]\n" + "\n".join(failures))
-    return generated
+        if not generated:
+            raise ValueError("未生成任何月报。" + ("\n" + "\n".join(failures) if failures else ""))
+        if failures:
+            print("[跳过]\n" + "\n".join(failures))
+        return generated
+    finally:
+        cleanup_work_dir(work_dir)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -122,6 +122,8 @@ python scripts\run_all.py --year 2026 --month 5 --station-type 清洁站
 python scripts\run_all.py --year 2026 --month 5 --station-type 中转站
 ```
 
+月报报告期为上月 20 日至本月 19 日。生成月报时，自动转换步骤只处理该报告期内的原始 `.doc` 日报；报告期外文件会跳过，不参与转换和汇总。
+
 指定转换引擎：
 
 ```powershell

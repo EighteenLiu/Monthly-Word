@@ -7,11 +7,111 @@ from .models import AggregationResult, LedgerRecord, StationItem, StationSummary
 from .normalizer import (
     CLEAN_TYPE,
     TRANSFER_TYPE,
-    build_summary,
+    compact_text,
     chinese_section_number,
+    ensure_period,
     item_display_name,
     level4_point_display_name,
+    normalize_problem_sentence,
 )
+
+
+ISSUE_TEXT_NO_PROBLEM = {
+    "无",
+    "无问题",
+    "良好",
+    "良好未发现问题",
+    "未发现问题",
+    "无异常",
+    "正常",
+    "合格",
+}
+
+PROBLEM_INDICATOR_RESULTS = {
+    CLEAN_TYPE: {
+        "标志不完整不清晰、喷涂不规范": {"有问题"},
+        "收集车辆敞口运输": {"有问题"},
+        "未开门运行": {"有问题", "不运行", "未运行"},
+        "无称重系统或称重系统损坏": {"有问题"},
+        "小型收集车混装混运": {"有问题"},
+        "箱体内垃圾混投": {"有问题"},
+        "拒收单不准确": {"有问题"},
+    },
+    TRANSFER_TYPE: {
+        "周边环境脏乱情况": {"周边环境脏乱"},
+        "可回收价格表": {"无可回收价格表"},
+        "备案公示": {"无备案公示"},
+        "消防水源是否合格": {"消防水源不合格"},
+        "消防安全水源": {"无消防安全水源"},
+        "营业执照": {"无营业执照"},
+        "安全风险公告": {"无安全风险公告"},
+        "称重系统损坏": {"称重系统损坏"},
+        "灭火器": {"灭火器不合格", "灭火器过期"},
+        "按规定区域存放灭火器等物品": {"灭火器等未按规定放置"},
+        "七禁收八不准承诺书情况": {"无七禁收八不准承诺书"},
+        "运输车辆防遗撒检查台账": {"无车辆信息、出入时间、装载品类及装载后的影像资料"},
+        "安全员情况": {"安全员上岗但无明显身份标识", "安全员未按时上岗"},
+        "灭火器和消防栓箱内有每月检查记录表": {"无"},
+        "开门运行情况": {"未按时开门运行", "不运行", "未运行"},
+        "企安安情况": {"无企安安"},
+        "灭蝇措施情况": {"无灭蝇措施"},
+    },
+}
+
+NON_PROBLEM_INDICATOR_RESULTS = {
+    CLEAN_TYPE: {
+        "标志不完整不清晰、喷涂不规范": {"无问题"},
+        "收集车辆敞口运输": {"无问题"},
+        "良好，未发现问题": {"操作规范及流程", "公告及文件", "灭火器", "内部环境", "运输车辆", "正门及门牌"},
+        "未开门运行": {"无问题"},
+        "无称重系统或称重系统损坏": {"无问题"},
+        "小型收集车混装混运": {"无问题"},
+        "箱体内垃圾混投": {"无问题"},
+        "拒收单不准确": {"无问题"},
+    },
+    TRANSFER_TYPE: {
+        "良好，未发现问题": {""},
+        "周边环境脏乱情况": {"良好，未发现问题"},
+        "可回收价格表": {"有可回收价格表"},
+        "备案公示": {"有备案公示"},
+        "消防水源是否合格": {"消防水源合格"},
+        "消防安全水源": {"有消防安全水源"},
+        "营业执照": {"有营业执照"},
+        "安全风险公告": {"有安全风险公告"},
+        "称重系统损坏": {"良好，未发现问题"},
+        "灭火器": {"灭火器合格"},
+        "按规定区域存放灭火器等物品": {"灭火器按规定放置"},
+        "七禁收八不准承诺书情况": {"有七禁八不准承诺书"},
+        "运输车辆防遗撒检查台账": {"有车辆信息、出入时间、装载品类及装载后的影像资料"},
+        "安全员情况": {"安全员按时上岗"},
+        "灭火器和消防栓箱内有每月检查记录表": {"有"},
+        "开门运行情况": {"按时开门运行"},
+        "企安安情况": {"有企安安"},
+        "灭蝇措施情况": {"有灭蝇措施"},
+    },
+}
+
+COMPACT_PROBLEM_INDICATOR_RESULTS = {
+    station_type: {
+        compact_text(indicator): {compact_text(result) for result in results}
+        for indicator, results in station_rules.items()
+    }
+    for station_type, station_rules in PROBLEM_INDICATOR_RESULTS.items()
+}
+
+COMPACT_NON_PROBLEM_INDICATOR_RESULTS = {
+    station_type: {
+        compact_text(indicator): {compact_text(result) for result in results}
+        for indicator, results in station_rules.items()
+    }
+    for station_type, station_rules in NON_PROBLEM_INDICATOR_RESULTS.items()
+}
+
+COMPACT_ISSUE_TEXT_NO_PROBLEM = {compact_text(text) for text in ISSUE_TEXT_NO_PROBLEM}
+COMPACT_NO_PROBLEM_INDICATORS = {
+    compact_text("良好，未发现问题"),
+    compact_text("良好未发现问题"),
+}
 
 
 def aggregate_records(records: list[LedgerRecord], report_date: date) -> AggregationResult:
@@ -36,16 +136,86 @@ def aggregate_type(records: list[LedgerRecord], station_type: str) -> list[Stati
                 street=street,
                 name=station_name,
                 display_name=f"{street}{station_name}",
-                summary=build_summary([record.issue_text for record in station_records]),
+                summary=build_station_summary(station_records, station_type),
                 items=items,
             )
         )
     return stations
 
 
+def build_station_summary(records: list[LedgerRecord], station_type: str) -> str:
+    problems: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if not is_problem_record(record, station_type):
+            continue
+        problem = problem_text(record)
+        if not problem or problem in seen:
+            continue
+        problems.append(problem)
+        seen.add(problem)
+
+    if not problems:
+        return "无问题。"
+    joined = "；".join(f"（{index}）{problem}" for index, problem in enumerate(problems, start=1))
+    return ensure_period(f"存在的问题是：{joined}")
+
+
+def issue_text_is_no_problem(text: str) -> bool:
+    return compact_text(text) in COMPACT_ISSUE_TEXT_NO_PROBLEM
+
+
+def is_problem_record(record: LedgerRecord, station_type: str) -> bool:
+    if issue_text_is_no_problem(record.issue_text):
+        return False
+
+    indicator = compact_text(record.indicator_name)
+    indicator_result = compact_text(record.indicator_result)
+    if indicator in COMPACT_NO_PROBLEM_INDICATORS:
+        return bool(indicator_result) and not issue_text_is_no_problem(indicator_result)
+    if not indicator:
+        return False
+
+    if indicator_result in COMPACT_NON_PROBLEM_INDICATOR_RESULTS.get(station_type, {}).get(indicator, set()):
+        return False
+    return indicator_result in COMPACT_PROBLEM_INDICATOR_RESULTS.get(station_type, {}).get(indicator, set())
+
+
+def problem_text(record: LedgerRecord) -> str:
+    indicator = compact_text(record.indicator_name)
+    indicator_result = compact_text(record.indicator_result)
+    if indicator == compact_text("未开门运行") and indicator_result in {compact_text("不运行"), compact_text("未运行")}:
+        return "未开门运行"
+    if indicator == compact_text("开门运行情况") and indicator_result in {compact_text("不运行"), compact_text("未运行")}:
+        return "未按时开门运行"
+
+    issue_text = normalize_problem_sentence(record.issue_text)
+    if issue_text and not issue_text_is_no_problem(issue_text):
+        return issue_text
+    if indicator in COMPACT_NO_PROBLEM_INDICATORS:
+        indicator_result = normalize_problem_sentence(record.indicator_result)
+        return indicator_result if indicator_result and not issue_text_is_no_problem(indicator_result) else ""
+    indicator_result = normalize_problem_sentence(record.indicator_result)
+    if indicator_result:
+        return indicator_result
+    return normalize_problem_sentence(record.indicator_name)
+
+
+def should_skip_detail_record(record: LedgerRecord) -> bool:
+    indicator = compact_text(record.indicator_name)
+    indicator_result = compact_text(record.indicator_result)
+    return (
+        indicator in COMPACT_NO_PROBLEM_INDICATORS
+        and not indicator_result
+        and issue_text_is_no_problem(record.issue_text)
+    )
+
+
 def build_items(records: list[LedgerRecord]) -> list[StationItem]:
     grouped: OrderedDict[str, StationItem] = OrderedDict()
     for record in records:
+        if should_skip_detail_record(record):
+            continue
         name = item_display_name(record.indicator_name, record.issue_text)
         item = grouped.setdefault(
             name,

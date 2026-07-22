@@ -16,6 +16,7 @@ from PIL import Image
 from .models import LedgerImage, LedgerRecord
 from .normalizer import (
     PHOTO_GROUP_NAMES,
+    SUPPORTED_TYPES,
     clean_cell,
     normalize_station_type,
     parse_date_like,
@@ -50,6 +51,7 @@ def read_ledger_dates(path: Path) -> dict[date, int]:
     raw_headers = [clean_cell(value) for value in rows[1]]
     headers = [header or group_headers[index] for index, header in enumerate(raw_headers)]
     field_indexes = build_field_indexes(group_headers, headers)
+    point_type_index = field_indexes.get("point_type")
     date_index = field_indexes.get("created_time")
     if date_index is None:
         date_index = field_indexes.get("report_time")
@@ -58,6 +60,9 @@ def read_ledger_dates(path: Path) -> dict[date, int]:
 
     available_dates: dict[date, int] = {}
     for row in rows[2:]:
+        point_type_value = row[int(point_type_index)] if point_type_index is not None and int(point_type_index) < len(row) else ""
+        if normalize_station_type(clean_cell(point_type_value)) not in SUPPORTED_TYPES:
+            continue
         date_value = row[int(date_index)] if date_index is not None and int(date_index) < len(row) else ""
         parsed_datetime = parse_datetime_like(date_value)
         parsed_date = report_date_from_created_time(parsed_datetime)
@@ -192,6 +197,9 @@ def build_records(
         created_time = parse_datetime_like(value(row, "created_time"))
         report_time = parse_datetime_like(value(row, "report_time"))
         check_date = report_date_from_created_time(created_time or report_time)
+        point_type = normalize_station_type(clean_cell(value(row, "point_type")))
+        if point_type not in SUPPORTED_TYPES:
+            continue
         row_images = sorted(
             [image for image in image_map.get(offset, []) if image.column_index in problem_photo_columns],
             key=lambda image: image.column_index,
@@ -201,7 +209,7 @@ def build_records(
                 row_index=offset,
                 serial_no=clean_cell(value(row, "serial_no")),
                 point_level_1=clean_cell(value(row, "point_level_1")),
-                point_type=normalize_station_type(clean_cell(value(row, "point_type"))),
+                point_type=point_type,
                 street=clean_cell(value(row, "street")),
                 station_name=clean_cell(value(row, "station_name")),
                 issue_text=clean_cell(value(row, "issue_text")),
