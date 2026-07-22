@@ -17,20 +17,20 @@ import shutil
 import subprocess
 import sys
 import uuid
+from copy import deepcopy
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 from docx import Document
-from docx.enum.section import WD_ORIENT
-from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.image.exceptions import UnrecognizedImageError
+from docx.table import _Cell
+from docx.text.paragraph import Paragraph
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
-from jinja2 import Environment
+from docx.shared import Cm, RGBColor
 from PIL import Image
 
 
@@ -48,8 +48,13 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "04_输出月报"
 DEFAULT_STATION_TYPE = "清洁站"
 DEFAULT_YEAR = 2026
 TEMP_WORK_ROOT_NAME = "_monthly_work"
-A4_WIDTH = Cm(21)
-A4_HEIGHT = Cm(29.7)
+MONTHLY_STREETS_LOOP_START = "{% for street in streets %}"
+MONTHLY_STREETS_LOOP_END = "{% endfor streets %}"
+MONTHLY_STATIONS_LOOP_START = "{% for station in street.stations %}"
+MONTHLY_STATIONS_LOOP_END = "{% endfor stations %}"
+MONTHLY_STREET_TEXT_MARKER = "{{ street.number }}{{ street.name }}"
+MONTHLY_STATION_TEXT_MARKER = "{{ station.number }}{{ station.name }}{{ station.date_suffix }}：{{ station.issue_text }}"
+MONTHLY_IMAGE_MARKER = "[[IMAGES:{{ station.image_key }}]]"
 
 DAILY_NAME_RE = re.compile(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
 DAILY_CODE_RE = re.compile(r"(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})")
@@ -105,6 +110,11 @@ STATION_PROFILES = {
         "unopened_category": "未按时开门运行",
         "non_problem_status_keywords": ("升级改造", "施工停运", "停运"),
     },
+}
+
+DEFAULT_MONTHLY_TEMPLATE_NAMES = {
+    "清洁站": "密闭式清洁站月报模板.docx",
+    "中转站": "中转站月报模板.docx",
 }
 
 
@@ -749,201 +759,248 @@ def collect_records(source_dirs: Path | list[Path], station_type: str, year: int
     )
 
 
-def set_cell_shading(cell, fill: str) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    shading = tc_pr.find(qn("w:shd"))
-    if shading is None:
-        shading = OxmlElement("w:shd")
-        tc_pr.append(shading)
-    shading.set(qn("w:fill"), fill)
-
-
-def set_table_borders(table) -> None:
-    tbl_pr = table._tbl.tblPr
-    borders = tbl_pr.find(qn("w:tblBorders"))
-    if borders is None:
-        borders = OxmlElement("w:tblBorders")
-        tbl_pr.append(borders)
-    for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        border = borders.find(qn(f"w:{border_name}"))
-        if border is None:
-            border = OxmlElement(f"w:{border_name}")
-            borders.append(border)
-        border.set(qn("w:val"), "single")
-        border.set(qn("w:sz"), "4")
-        border.set(qn("w:space"), "0")
-        border.set(qn("w:color"), "000000")
-
-
-def set_repeat_table_header(row) -> None:
-    tr_pr = row._tr.get_or_add_trPr()
-    tbl_header = tr_pr.find(qn("w:tblHeader"))
-    if tbl_header is None:
-        tbl_header = OxmlElement("w:tblHeader")
-        tr_pr.append(tbl_header)
-    tbl_header.set(qn("w:val"), "true")
-
-
-def set_table_row_min_height(row, height_cm: float = 0.8) -> None:
-    row.height = Cm(height_cm)
-    row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
-
-
-def set_cell_text(cell, text: str, bold: bool = False) -> None:
-    cell.text = ""
-    paragraph = cell.paragraphs[0]
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.paragraph_format.space_before = Pt(0)
-    paragraph.paragraph_format.space_after = Pt(0)
-    run = paragraph.add_run(text)
-    run.bold = bold
-    run.font.name = "仿宋_GB2312"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
-    run.font.size = Pt(10)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-
-
 def remove_empty_paragraph(paragraph) -> None:
     paragraph._element.getparent().remove(paragraph._element)
     paragraph._p = paragraph._element = None
 
 
-def cleanup_empty_paragraphs(document: Document) -> None:
-    for paragraph in list(document.paragraphs):
-        xml = paragraph._p.xml
-        if paragraph.text.strip():
-            continue
-        if "a:blip" in xml or "v:imagedata" in xml or "w:sectPr" in xml:
-            continue
-        remove_empty_paragraph(paragraph)
+def default_monthly_template_path(station_type: str) -> Path | None:
+    template_name = DEFAULT_MONTHLY_TEMPLATE_NAMES.get(normalize_station_type(station_type))
+    if not template_name:
+        return None
+    candidate = DEFAULT_TEMPLATE_DIR / template_name
+    return candidate if candidate.exists() else None
 
 
-def clear_document_body(document: Document) -> None:
-    body = document._body._element
-    for child in list(body):
-        if child.tag == qn("w:sectPr"):
-            continue
-        body.remove(child)
+def resolve_monthly_template_path(template_path: Path | None, station_type: str) -> Path | None:
+    if template_path and template_path.exists():
+        return template_path
+    return default_monthly_template_path(station_type)
 
 
 def create_document_from_template(template_path: Path | None) -> Document:
     if template_path and template_path.exists():
-        document = Document(str(template_path))
-        clear_document_body(document)
-        return document
+        return Document(str(template_path))
     return Document()
 
 
-def configure_portrait_a4_section(section) -> None:
-    section.orientation = WD_ORIENT.PORTRAIT
-    section.page_width = A4_WIDTH
-    section.page_height = A4_HEIGHT
-    section.top_margin = Cm(2.54)
-    section.bottom_margin = Cm(2.54)
-    section.left_margin = Cm(3.18)
-    section.right_margin = Cm(3.18)
+def replace_paragraph_text(paragraph, text: str) -> None:
+    replace_text_nodes(paragraph._p, text)
 
 
-def configure_landscape_a4_section(section) -> None:
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width = A4_HEIGHT
-    section.page_height = A4_WIDTH
-    section.top_margin = Cm(2.54)
-    section.bottom_margin = Cm(2.54)
-    section.left_margin = Cm(2.54)
-    section.right_margin = Cm(2.54)
+def replace_text_nodes(element, text: str) -> None:
+    text_nodes = list(element.iter(qn("w:t")))
+    if not text_nodes:
+        return
+    text_nodes[0].text = text
+    for node in text_nodes[1:]:
+        node.text = ""
 
 
-def add_title(document: Document, text: str) -> None:
-    title = document.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title.paragraph_format.space_after = Pt(18)
-    run = title.add_run(text)
-    run.bold = True
-    run.font.name = "黑体"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-    run.font.size = Pt(22)
+def template_run(paragraph):
+    return paragraph.runs[0] if paragraph.runs else None
 
 
-def read_docx_template_lines(template_path: Path | None, profile: dict) -> list[str]:
-    if not template_path or not template_path.exists():
-        return []
-    source = Document(str(template_path))
-    lines = [paragraph.text.strip() for paragraph in source.paragraphs if paragraph.text.strip()]
-    if not lines:
-        return []
-
-    parsed: list[str] = []
-    saw_summary = False
-    saw_detail = False
-    for index, line in enumerate(lines):
-        if index == 0:
-            parsed.append("{{ title }}")
-            continue
-        if "总体情况" in line and not saw_summary:
-            parsed.extend(["", "{{ summary_heading }}", "{{ summary }}"])
-            saw_summary = True
-            continue
-        if ("各街道" in line or "街道案例" in line) and not saw_detail:
-            parsed.extend(["", "{{ detail_heading }}", "{% if streets %}"])
-            parsed.extend(default_street_template_lines())
-            parsed.extend(["{% else %}", "{{ no_detail_text }}", "{% endif %}"])
-            saw_detail = True
-            break
-        if "附件" in line:
-            break
-
-    if saw_summary and saw_detail:
-        return parsed
-    return []
+def apply_run_font(run, source_run=None) -> None:
+    if source_run is not None and source_run._r.rPr is not None:
+        run._r.insert(0, deepcopy(source_run._r.rPr))
 
 
-def default_street_template_lines() -> list[str]:
-    return [
-        "{% for street in streets %}",
-        "{{ street.heading }}",
-        "{% for station in street.stations %}",
-        "[[STATION:{{ station.key }}]]",
-        "[[IMAGES:{{ station.image_key }}]]",
-        "{% endfor %}",
-        "{% endfor %}",
-    ]
+def clone_paragraph_after(source_paragraph, text: str = ""):
+    new_p = OxmlElement("w:p")
+    if source_paragraph._p.pPr is not None:
+        new_p.append(deepcopy(source_paragraph._p.pPr))
+    source_paragraph._p.addnext(new_p)
+    paragraph = Paragraph(new_p, source_paragraph._parent)
+    if text:
+        run = paragraph.add_run(text)
+        apply_run_font(run, template_run(source_paragraph))
+    return paragraph
 
 
-def default_jinja_template_content(profile: dict) -> str:
-    lines = [
-        "{{ title }}",
-        "",
-        "{{ summary_heading }}",
-        "{{ summary }}",
-        "",
-        "{{ detail_heading }}",
-        "{% if streets %}",
-        *default_street_template_lines(),
-        "{% else %}",
-        "{{ no_detail_text }}",
-        "{% endif %}",
-        "",
-    ]
-    return "\n".join(lines)
+def clone_styled_paragraph_after(cursor_paragraph, style_paragraph, text: str):
+    new_p = deepcopy(style_paragraph._p)
+    replace_text_nodes(new_p, text)
+    cursor_paragraph._p.addnext(new_p)
+    return Paragraph(new_p, cursor_paragraph._parent)
 
 
-def export_jinja_text_template(
-    template_path: Path | None,
-    station_type: str,
-    profile: dict,
-    work_dir: Path | None = None,
-) -> Path | None:
-    if not template_path:
-        return None
-    target_dir = work_dir or create_monthly_work_dir(DEFAULT_OUTPUT_DIR, PROJECT_ROOT)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    station_name = normalize_station_type(station_type)
-    target = target_dir / f"{station_name}_auto_template.jinja2"
-    parsed_lines = read_docx_template_lines(template_path, profile)
-    content = "\n".join(parsed_lines) if parsed_lines else default_jinja_template_content(profile)
-    target.write_text(content, encoding="utf-8")
-    return target
+def add_styled_run(paragraph, text: str, source_run=None, color: RGBColor | None = None):
+    run = paragraph.add_run(text)
+    apply_run_font(run, source_run)
+    if color is not None:
+        run.font.color.rgb = color
+    return run
+
+
+def clone_station_paragraph_after(cursor_paragraph, style_paragraph, station: dict):
+    template_text = style_paragraph.text.strip()
+    values = prefixed_template_values("station", station)
+    issue_marker = "{{ station.issue_text }}"
+    if issue_marker not in template_text:
+        station_text = render_text_template(template_text, values)
+        return clone_styled_paragraph_after(cursor_paragraph, style_paragraph, station_text)
+
+    prefix_template, suffix_template = template_text.split(issue_marker, 1)
+    prefix = render_text_template(prefix_template, values)
+    suffix = render_text_template(suffix_template, values)
+    source_run = template_run(style_paragraph)
+
+    paragraph = clone_paragraph_after(cursor_paragraph)
+    copy_paragraph_shape(paragraph, style_paragraph)
+    add_styled_run(paragraph, prefix, source_run)
+    issue_color = RGBColor(255, 0, 0) if station.get("has_problem") else None
+    add_styled_run(paragraph, station["issue_text"], source_run, issue_color)
+    if suffix:
+        add_styled_run(paragraph, suffix, source_run)
+    return paragraph
+
+
+def remove_paragraphs(paragraphs) -> None:
+    for paragraph in paragraphs:
+        if paragraph is not None and paragraph._element is not None:
+            remove_empty_paragraph(paragraph)
+
+
+def find_marker_paragraph(document: Document, marker: str):
+    return next((paragraph for paragraph in document.paragraphs if paragraph.text.strip() == marker), None)
+
+
+def find_marker_paragraph_index(document: Document, marker: str) -> int | None:
+    for index, paragraph in enumerate(document.paragraphs):
+        if paragraph.text.strip() == marker:
+            return index
+    return None
+
+
+def render_text_template(template_text: str, values: dict[str, str]) -> str:
+    rendered = template_text
+    for key, value in values.items():
+        rendered = rendered.replace("{{ " + key + " }}", str(value))
+    return rendered
+
+
+def prefixed_template_values(prefix: str, values: dict) -> dict[str, str]:
+    result = dict(values)
+    result.update({f"{prefix}.{key}": value for key, value in values.items()})
+    return result
+
+
+def strip_chinese_heading_number(text: str) -> str:
+    return re.sub(r"^[一二三四五六七八九十]+、", "", text)
+
+
+def render_static_paragraph_text(template_text: str, replacements: dict[str, str]) -> str:
+    rendered = template_text
+    for marker, value in replacements.items():
+        replacement = str(value)
+        prefix = rendered.split(marker, 1)[0] if marker in rendered else ""
+        if re.search(r"[一二三四五六七八九十]+、\s*$", prefix):
+            replacement = strip_chinese_heading_number(replacement)
+        rendered = rendered.replace(marker, replacement)
+    return rendered
+
+
+def render_monthly_template_docx(
+    document: Document,
+    context: dict,
+    image_map: dict[str, tuple[ImageRow, ...]],
+) -> None:
+    street_loop_start_index = find_marker_paragraph_index(document, MONTHLY_STREETS_LOOP_START)
+    street_loop_end_index = find_marker_paragraph_index(document, MONTHLY_STREETS_LOOP_END)
+    if street_loop_start_index is None or street_loop_end_index is None:
+        raise ValueError(
+            "月报模板缺少街道循环块，请检查 "
+            f"{MONTHLY_STREETS_LOOP_START} / {MONTHLY_STREETS_LOOP_END}"
+        )
+    if street_loop_end_index <= street_loop_start_index:
+        raise ValueError("月报模板街道循环块结束位置早于开始位置")
+
+    street_loop = document.paragraphs[street_loop_start_index : street_loop_end_index + 1]
+    marker_paragraph = street_loop[0]
+    station_loop_start = next((p for p in street_loop if p.text.strip() == MONTHLY_STATIONS_LOOP_START), None)
+    station_loop_end = next((p for p in street_loop if p.text.strip() == MONTHLY_STATIONS_LOOP_END), None)
+    street_style = next((p for p in street_loop if p.text.strip() == MONTHLY_STREET_TEXT_MARKER), None)
+    station_style = next((p for p in street_loop if p.text.strip() == MONTHLY_STATION_TEXT_MARKER), None)
+    image_style = next((p for p in street_loop if p.text.strip() == MONTHLY_IMAGE_MARKER), None)
+    if station_loop_start is None or station_loop_end is None:
+        raise ValueError(
+            "月报模板缺少站点循环块，请检查 "
+            f"{MONTHLY_STATIONS_LOOP_START} / {MONTHLY_STATIONS_LOOP_END}"
+        )
+    if street_style is None:
+        raise ValueError(f"月报模板缺少街道名称占位符：{MONTHLY_STREET_TEXT_MARKER}")
+    if station_style is None:
+        raise ValueError(f"月报模板缺少站点正文占位符：{MONTHLY_STATION_TEXT_MARKER}")
+    if image_style is None:
+        raise ValueError(f"月报模板缺少图片占位符：{MONTHLY_IMAGE_MARKER}")
+
+    replacements = {
+        "{{ title }}": context["title"],
+        "{{ summary_heading }}": context["summary_heading"],
+        "{{ summary }}": context["summary"],
+        "{{ detail_heading }}": context["detail_heading"],
+        "{{ attachment_heading }}": (
+            f"附件：{context['start_date']}至{context['end_date']}"
+            f"{context['attachment_subject']}各项指标问题数"
+        ),
+    }
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if any(marker in text for marker in replacements):
+            replace_paragraph_text(paragraph, render_static_paragraph_text(text, replacements))
+
+    cursor = marker_paragraph
+    if context["streets"]:
+        for street in context["streets"]:
+            street_text = render_text_template(street_style.text.strip(), prefixed_template_values("street", street))
+            cursor = clone_styled_paragraph_after(cursor, street_style, street_text)
+            for station in street["stations"]:
+                cursor = clone_station_paragraph_after(cursor, station_style, station)
+                cursor = add_image_rows_after(cursor, image_map.get(station["image_key"], ()), image_style)
+    else:
+        cursor = clone_styled_paragraph_after(cursor, station_style, context["no_detail_text"])
+
+    remove_paragraphs(street_loop)
+
+
+def copy_paragraph_shape(target, source) -> None:
+    if source._p.pPr is not None:
+        target._p.get_or_add_pPr()
+        current = target._p.pPr
+        current.getparent().remove(current)
+        target._p.insert(0, deepcopy(source._p.pPr))
+
+
+def add_image_rows_after(cursor, image_rows: tuple[ImageRow, ...], source_paragraph):
+    images = [image for image_row in image_rows for image in image_row.images]
+    image_width = Cm(4.55)
+    for index in range(0, len(images), 3):
+        paragraph = clone_paragraph_after(cursor)
+        copy_paragraph_shape(paragraph, source_paragraph)
+        paragraph.text = ""
+        paragraph.alignment = source_paragraph.alignment
+        for image in images[index : index + 3]:
+            run = paragraph.add_run()
+            add_picture_preserve_blob(run, image.blob, image_width)
+        cursor = paragraph
+    return cursor
+
+
+def add_picture_preserve_blob(run, blob: bytes, width) -> None:
+    try:
+        run.add_picture(io.BytesIO(blob), width=width)
+        return
+    except UnrecognizedImageError:
+        pass
+
+    image_stream = io.BytesIO()
+    with Image.open(io.BytesIO(blob)) as pil_image:
+        if pil_image.mode not in ("RGB", "L"):
+            pil_image = pil_image.convert("RGB")
+        pil_image.save(image_stream, format="JPEG", quality=85, optimize=True)
+    image_stream.seek(0)
+    run.add_picture(image_stream, width=width)
 
 
 def build_template_context(
@@ -958,34 +1015,44 @@ def build_template_context(
     by_street, counts = summarize_records(body_records, categories)
 
     image_map: dict[str, tuple[ImageRow, ...]] = {}
-    station_map: dict[str, dict] = {}
     streets: list[dict] = []
     for street_index, (street, street_records) in enumerate(by_street.items(), start=1):
         use_station_numbers = len(street_records) > 1
         stations: list[dict] = []
         for station_index, record in enumerate(street_records, start=1):
             issue_text, has_problem = format_station_issue_text(record, profile)
-            station_label = format_station_label(record, station_index, use_station_numbers, station_type)
             image_key = f"s{street_index}_p{station_index}"
             station_key = image_key
+            station_number = (
+                f"{station_index}."
+                if normalize_station_type(station_type) == "清洁站" and use_station_numbers
+                else ""
+            )
+            date_suffix = (
+                f"（{format_record_date_code(record)}）"
+                if normalize_station_type(station_type) == "中转站"
+                else ""
+            )
             image_map[image_key] = (
                 tuple(record.image_rows) if has_problem else limit_image_rows(tuple(record.image_rows), 3)
             )
             station_data = {
                 "key": station_key,
+                "index": station_index,
+                "number": station_number,
                 "name": record.station,
-                "label": station_label,
+                "date_suffix": date_suffix,
                 "issue_text": issue_text,
-                "text": f"{station_label}：{issue_text}",
                 "image_key": image_key,
                 "has_problem": has_problem,
             }
-            station_map[station_key] = station_data
             stations.append(station_data)
         streets.append(
             {
                 "name": street,
                 "index": street_index,
+                "index_cn": chinese_section_number(street_index),
+                "number": f"（{chinese_section_number(street_index)}）",
                 "heading": f"（{chinese_section_number(street_index)}）{street}",
                 "stations": stations,
             }
@@ -999,7 +1066,6 @@ def build_template_context(
         "detail_heading": profile["detail_heading"],
         "no_detail_text": "本月未发现需列入街道情况的站点。",
         "streets": streets,
-        "station_map": station_map,
         "start_date": format_date_cn(start),
         "end_date": format_date_cn(end),
         "year": year,
@@ -1008,195 +1074,6 @@ def build_template_context(
         "attachment_subject": profile["attachment_subject"],
     }
     return context, image_map, counts
-
-
-def render_jinja_body(document: Document, jinja_path: Path | None, context: dict, image_map: dict[str, tuple[ImageRow, ...]]) -> None:
-    template_text = jinja_path.read_text(encoding="utf-8") if jinja_path and jinja_path.exists() else default_jinja_template_content({})
-    rendered = Environment(autoescape=False, trim_blocks=True, lstrip_blocks=True).from_string(template_text).render(**context)
-    for raw_line in rendered.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        station_match = re.fullmatch(r"\[\[STATION:(?P<key>[A-Za-z0-9_:-]+)\]\]", line)
-        if station_match:
-            station = context["station_map"].get(station_match.group("key"))
-            if station:
-                add_station_paragraph(document, station["label"], station["issue_text"], station["has_problem"])
-            continue
-        image_match = re.fullmatch(r"\[\[IMAGES:(?P<key>[A-Za-z0-9_:-]+)\]\]", line)
-        if image_match:
-            add_image_rows(document, image_map.get(image_match.group("key"), ()))
-            continue
-        if line == context["title"]:
-            add_title(document, line)
-        elif line in (context["summary_heading"], context["detail_heading"]) or re.match(r"^[一二三四五六七八九十]+、", line):
-            add_heading(document, line, level=1)
-        elif re.match(r"^（[一二三四五六七八九十]+）", line):
-            add_heading(document, line, level=2)
-        else:
-            add_paragraph(document, line)
-
-
-def configure_styles(document: Document) -> None:
-    normal = document.styles["Normal"]
-    normal.font.name = "仿宋"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-    normal.font.size = Pt(16)
-
-    title = get_or_create_paragraph_style(document, ("Title", "标题"), "Title")
-    if title:
-        title.font.name = "黑体"
-        title._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-        title.font.size = Pt(18)
-        title.font.bold = True
-
-    heading1 = get_or_create_paragraph_style(document, ("Heading 1", "标题 1", "标题1", "Heading1"), "Heading 1")
-    if heading1:
-        heading1.font.name = "黑体"
-        heading1._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-        heading1.font.size = Pt(16)
-        heading1.font.bold = True
-        heading1.font.color.rgb = RGBColor(0, 0, 0)
-        set_style_outline_level(heading1, 0)
-
-    heading2 = get_or_create_paragraph_style(document, ("Heading 2", "标题 2", "标题2", "Heading2"), "Heading 2")
-    if heading2:
-        heading2.font.name = "楷体_GB2312"
-        heading2._element.rPr.rFonts.set(qn("w:eastAsia"), "楷体_GB2312")
-        heading2.font.size = Pt(16)
-        heading2.font.bold = True
-        heading2.font.color.rgb = RGBColor(0, 0, 0)
-        set_style_outline_level(heading2, 1)
-
-    heading3 = get_or_create_paragraph_style(document, ("Heading 3", "标题 3", "标题3", "Heading3"), "Heading 3")
-    if heading3:
-        heading3.font.name = "仿宋"
-        heading3._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-        heading3.font.size = Pt(16)
-        heading3.font.bold = False
-        heading3.font.color.rgb = RGBColor(0, 0, 0)
-        set_style_outline_level(heading3, 2)
-
-
-def get_first_style(document: Document, names: tuple[str, ...]):
-    for name in names:
-        try:
-            return document.styles[name]
-        except KeyError:
-            continue
-    for style in document.styles:
-        if style.style_id in names:
-            return style
-    return None
-
-
-def get_or_create_paragraph_style(document: Document, names: tuple[str, ...], fallback_name: str):
-    style = get_first_style(document, names)
-    if style:
-        return style
-    return document.styles.add_style(fallback_name, WD_STYLE_TYPE.PARAGRAPH)
-
-
-def set_style_outline_level(style, level: int) -> None:
-    p_pr = style._element.get_or_add_pPr()
-    remove_numbering_from_ppr(p_pr)
-    outline = p_pr.find(qn("w:outlineLvl"))
-    if outline is None:
-        outline = OxmlElement("w:outlineLvl")
-        p_pr.append(outline)
-    outline.set(qn("w:val"), str(level))
-    q_format = style._element.find(qn("w:qFormat"))
-    if q_format is None:
-        style._element.append(OxmlElement("w:qFormat"))
-
-
-def get_heading_style_name(document: Document, level: int) -> str | None:
-    style = get_or_create_paragraph_style(
-        document,
-        (f"Heading {level}", f"标题 {level}", f"标题{level}", f"Heading{level}"),
-        f"Heading {level}",
-    )
-    return style.name if style else None
-
-
-def remove_numbering_from_ppr(p_pr) -> None:
-    num_pr = p_pr.find(qn("w:numPr"))
-    if num_pr is not None:
-        p_pr.remove(num_pr)
-
-
-def remove_paragraph_numbering(paragraph) -> None:
-    p_pr = paragraph._p.get_or_add_pPr()
-    remove_numbering_from_ppr(p_pr)
-
-
-def add_paragraph(document: Document, text: str, *, bold: bool = False, align=None) -> None:
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.first_line_indent = None if bold else Cm(0.74)
-    paragraph.paragraph_format.line_spacing = 1.5
-    paragraph.paragraph_format.space_after = Pt(0)
-    if align is not None:
-        paragraph.alignment = align
-    run = paragraph.add_run(text)
-    run.bold = bold
-    run.font.name = "黑体" if bold else "仿宋"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体" if bold else "仿宋")
-    run.font.size = Pt(16)
-
-
-def add_station_paragraph(document: Document, label: str, issue_text: str, has_problem: bool) -> None:
-    paragraph = document.add_paragraph(style=get_heading_style_name(document, 3))
-    remove_paragraph_numbering(paragraph)
-    paragraph.paragraph_format.first_line_indent = Cm(0.74)
-    paragraph.paragraph_format.line_spacing = 1.5
-    paragraph.paragraph_format.space_after = Pt(0)
-
-    label_run = paragraph.add_run(f"{label}：")
-    label_run.font.name = "仿宋"
-    label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-    label_run.font.size = Pt(16)
-
-    issue_run = paragraph.add_run(issue_text)
-    issue_run.font.name = "仿宋"
-    issue_run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-    issue_run.font.size = Pt(16)
-    if has_problem:
-        issue_run.font.color.rgb = RGBColor(255, 0, 0)
-
-
-def add_image_rows(document: Document, image_rows: tuple[ImageRow, ...]) -> None:
-    images = [image for image_row in image_rows for image in image_row.images]
-    image_width = Cm(4.55)
-    for index in range(0, len(images), 3):
-        row_images = images[index : index + 3]
-        paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.paragraph_format.line_spacing = 1.0
-        paragraph.paragraph_format.space_before = Pt(0)
-        paragraph.paragraph_format.space_after = Pt(0)
-        for image in row_images:
-            run = paragraph.add_run()
-            image_stream = io.BytesIO()
-            with Image.open(io.BytesIO(image.blob)) as pil_image:
-                pil_image.save(image_stream, format="PNG")
-            image_stream.seek(0)
-            run.add_picture(image_stream, width=image_width)
-
-
-def add_heading(document: Document, text: str, level: int) -> None:
-    paragraph = document.add_paragraph(style=get_heading_style_name(document, level))
-    remove_paragraph_numbering(paragraph)
-    paragraph.paragraph_format.first_line_indent = None
-    paragraph.paragraph_format.line_spacing = 1.5
-    paragraph.paragraph_format.space_before = Pt(6 if level == 1 else 3)
-    paragraph.paragraph_format.space_after = Pt(0)
-    run = paragraph.add_run(text)
-    run.bold = True
-    font_name = "楷体_GB2312" if level == 2 else "仿宋" if level == 3 else "黑体"
-    run.font.name = font_name
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
-    run.font.size = Pt(16)
-    run.font.color.rgb = RGBColor(0, 0, 0)
 
 
 def chinese_section_number(index: int) -> str:
@@ -1246,12 +1123,6 @@ def format_station_issue_text(record: DailyRecord, profile: dict | None = None) 
 
 def format_record_date_code(record: DailyRecord) -> str:
     return f"{record.month:02d}{record.day:02d}"
-
-
-def format_station_label(record: DailyRecord, station_index: int, use_station_numbers: bool, station_type: str) -> str:
-    if normalize_station_type(station_type) == "中转站":
-        return f"{record.station}（{format_record_date_code(record)}）"
-    return f"{station_index}.{record.station}" if use_station_numbers else record.station
 
 
 def build_body_records(
@@ -1438,30 +1309,60 @@ def build_summary_sentence(
     return f"{prefix}检查发现需通报问题站次{len(problem_records)}个。"
 
 
-def add_issue_table(document: Document, counts: dict[str, dict[str, int]], categories: list[tuple[str, tuple[str, ...]]]) -> None:
+def clear_cell_content(cell: _Cell) -> None:
+    for paragraph in cell.paragraphs:
+        paragraph.text = ""
+    for table in list(cell.tables):
+        table._element.getparent().remove(table._element)
+
+
+def fill_cell_preserve_style(cell: _Cell, text: str, bold: bool | None = None) -> None:
+    source_paragraph = cell.paragraphs[0] if cell.paragraphs else None
+    source_run = template_run(source_paragraph) if source_paragraph is not None else None
+    source_ppr = (
+        deepcopy(source_paragraph._p.pPr)
+        if source_paragraph is not None and source_paragraph._p.pPr is not None
+        else None
+    )
+    source_rpr = deepcopy(source_run._r.rPr) if source_run is not None and source_run._r.rPr is not None else None
+    clear_cell_content(cell)
+    paragraph = cell.paragraphs[0]
+    if source_ppr is not None:
+        paragraph._p.get_or_add_pPr()
+        current = paragraph._p.pPr
+        current.getparent().remove(current)
+        paragraph._p.insert(0, source_ppr)
+    run = paragraph.add_run(text)
+    if source_rpr is not None:
+        run._r.insert(0, source_rpr)
+    if bold is not None:
+        run.bold = bold
+
+
+def delete_table_rows(table, start_index: int = 1) -> None:
+    for row in list(table.rows)[start_index:]:
+        table._tbl.remove(row._tr)
+
+
+def append_row_like(table, template_row):
+    new_tr = deepcopy(template_row._tr)
+    table._tbl.append(new_tr)
+    return table.rows[-1]
+
+
+def issue_table_rows(
+    counts: dict[str, dict[str, int]],
+    categories: list[tuple[str, tuple[str, ...]]],
+) -> tuple[list[str], list[list[str]]]:
     headers = ["街道名称", *[category for category, _ in categories], "问题总数"]
-    table = document.add_table(rows=1, cols=len(headers))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
-    table.autofit = True
-    set_table_borders(table)
-    set_repeat_table_header(table.rows[0])
-    set_table_row_min_height(table.rows[0])
-
-    for index, header in enumerate(headers):
-        cell = table.rows[0].cells[index]
-        set_cell_text(cell, header, bold=True)
-        set_cell_shading(cell, "D9EAF7")
-
     total_by_category = {category: 0 for category, _ in categories}
     for street_counts in counts.values():
         for category, value in street_counts.items():
             total_by_category[category] += value
 
+    result_rows: list[list[str]] = []
     rows = [("总计", total_by_category), *counts.items()]
     for street, street_counts in rows:
-        row = table.add_row()
-        set_table_row_min_height(row)
         values = [street]
         problem_total = 0
         for category, _ in categories:
@@ -1469,8 +1370,34 @@ def add_issue_table(document: Document, counts: dict[str, dict[str, int]], categ
             problem_total += value
             values.append("" if value == 0 else str(value))
         values.append("" if problem_total == 0 else str(problem_total))
-        for index, value in enumerate(values):
-            set_cell_text(row.cells[index], value)
+        result_rows.append(values)
+    return headers, result_rows
+
+
+def fill_template_issue_table(
+    table,
+    counts: dict[str, dict[str, int]],
+    categories: list[tuple[str, tuple[str, ...]]],
+) -> None:
+    headers, body_rows = issue_table_rows(counts, categories)
+    if len(table.columns) != len(headers):
+        raise ValueError("模板附件表列数与当前月报问题分类不一致")
+
+    header_row = table.rows[0]
+    body_template = table.rows[1] if len(table.rows) > 1 else header_row
+    delete_table_rows(table, 1)
+    for index, header in enumerate(headers):
+        fill_cell_preserve_style(header_row.cells[index], header)
+    for row_values in body_rows:
+        row = append_row_like(table, body_template)
+        for index, value in enumerate(row_values):
+            fill_cell_preserve_style(row.cells[index], value)
+
+
+def add_issue_table(document: Document, counts: dict[str, dict[str, int]], categories: list[tuple[str, tuple[str, ...]]]) -> None:
+    if not document.tables:
+        raise ValueError("月报模板缺少附件统计表，无法继承表格样式")
+    fill_template_issue_table(document.tables[-1], counts, categories)
 
 
 def create_monthly_docx(
@@ -1492,36 +1419,14 @@ def create_monthly_docx(
         work_dir = create_monthly_work_dir(output_path.parent, PROJECT_ROOT)
 
     try:
+        template_path = resolve_monthly_template_path(template_path, station_type)
+        if template_path is None:
+            raise FileNotFoundError(f"未找到{station_type}月报模板，请检查 03_月报模板 目录。")
         document = create_document_from_template(template_path)
-        jinja_path = export_jinja_text_template(template_path, station_type, profile, work_dir)
-        if jinja_path:
-            print(f"[临时] 已生成 Jinja2 文本模板：{jinja_path}")
-        configure_styles(document)
-
-        configure_portrait_a4_section(document.sections[0])
-
         context, image_map, counts = build_template_context(records, year, month, station_type, profile, categories)
-        render_jinja_body(document, jinja_path, context, image_map)
 
-        landscape = document.add_section(WD_ORIENT.LANDSCAPE)
-        configure_landscape_a4_section(landscape)
-
-        start, end = report_period(year, month)
-        attachment = document.add_paragraph()
-        attachment.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        attachment.paragraph_format.space_before = Pt(8)
-        attachment.paragraph_format.space_after = Pt(8)
-        run = attachment.add_run(
-            f"附件：{format_date_cn(start)}至{format_date_cn(end)}"
-            f"{profile['attachment_subject']}各项指标问题数"
-        )
-        run.font.name = "仿宋"
-        run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-        run.font.size = Pt(14)
-
+        render_monthly_template_docx(document, context, image_map)
         add_issue_table(document, counts, categories)
-
-        cleanup_empty_paragraphs(document)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             document.save(output_path)

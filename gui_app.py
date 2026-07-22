@@ -48,6 +48,7 @@ from daily_report_generator.services.normalizer import CLEAN_TYPE, TRANSFER_TYPE
 from daily_report_generator.services.renderer import render_reports  # noqa: E402
 from scripts.monthly_generator import (  # noqa: E402
     DEFAULT_CONVERTED_DIR,
+    DEFAULT_MONTHLY_TEMPLATE_NAMES,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RAW_INPUT_DIR,
     DEFAULT_TEMPLATE_DIR,
@@ -57,7 +58,13 @@ from scripts.monthly_generator import (  # noqa: E402
 
 
 def find_default_month_template(keyword: str) -> str:
+    for template_name in DEFAULT_MONTHLY_TEMPLATE_NAMES.values():
+        if keyword in template_name:
+            candidate = DEFAULT_TEMPLATE_DIR / template_name
+            if candidate.exists():
+                return str(candidate)
     matches = sorted(DEFAULT_TEMPLATE_DIR.glob(f"*{keyword}*.docx"))
+    matches = [path for path in matches if not path.name.startswith("~$")]
     return str(matches[0]) if matches else ""
 
 
